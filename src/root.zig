@@ -6,4 +6,6 @@ test {
     _ = @import("store.zig");
     _ = @import("bruteforce.zig");
     _ = @import("heap.zig");
+    _ = @import("hnsw.zig");
+    _ = @import("ollama.zig");
 }
