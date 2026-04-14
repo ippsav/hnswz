@@ -5,4 +5,5 @@ test {
     _ = @import("distance.zig");
     _ = @import("store.zig");
     _ = @import("bruteforce.zig");
+    _ = @import("heap.zig");
 }
