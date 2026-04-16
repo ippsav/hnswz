@@ -3,4 +3,5 @@ zig-cache
 /refs
 zig-out/
 .DS_Store
+wiki_paragraphs/
 
