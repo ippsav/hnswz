@@ -24,22 +24,24 @@ pub fn search(
     allocator: std.mem.Allocator,
 ) ![]Result {
     std.debug.assert(query.len == store.dim);
-    const n = store.count;
 
-    const all = try allocator.alloc(Result, n);
+    const all = try allocator.alloc(Result, store.live_count);
     defer allocator.free(all);
 
-    for (0..n) |i| {
+    var idx: usize = 0;
+    for (0..store.count) |i| {
         const id: u32 = @intCast(i);
-        all[i] = .{
+        if (store.isDeleted(id)) continue;
+        all[idx] = .{
             .id = id,
             .dist = distance.cosineNormalized(query, store.get(id)),
         };
+        idx += 1;
     }
 
     std.mem.sort(Result, all, {}, resultLessThan);
 
-    const actual_k = @min(k, n);
+    const actual_k = @min(k, store.live_count);
     const top_k = try allocator.alloc(Result, actual_k);
     @memcpy(top_k, all[0..actual_k]);
     return top_k;

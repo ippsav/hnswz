@@ -177,7 +177,7 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, sourc
     std.debug.print("\n", .{});
 
     try store.save(data_dir, cfg.storage.vectors_file);
-    try index.save(data_dir, cfg.storage.graph_file);
+    try index.save(data_dir, cfg.storage.graph_file, null);
     try hnswz.metadata.save(data_dir, cfg.storage.metadata_file, filenames.items);
 
     log.info("index built: {d} vectors saved to {s}", .{ n, cfg.storage.data_dir });
@@ -240,8 +240,8 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
     };
     defer md.deinit(allocator);
 
-    if (md.count != store.count) {
-        log.err("metadata count ({d}) != vectors count ({d})", .{ md.count, store.count });
+    if (md.count != store.live_count) {
+        log.err("metadata count ({d}) != vectors count ({d})", .{ md.count, store.live_count });
         std.process.exit(1);
     }
 
