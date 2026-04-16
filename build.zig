@@ -152,6 +152,15 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("benchmark", "Run the HNSW benchmark suite");
     bench_step.dependOn(&bench_cmd.step);
 
+    // `zig build serve` — launch a long-running DB server. Extra flags
+    // pass through: `zig build serve -- --config config.json --listen 127.0.0.1:9000`.
+    const serve_cmd = b.addRunArtifact(exe);
+    serve_cmd.step.dependOn(b.getInstallStep());
+    serve_cmd.addArg("serve");
+    if (b.args) |extra| serve_cmd.addArgs(extra);
+    const serve_step = b.step("serve", "Run the hnswz TCP server");
+    serve_step.dependOn(&serve_cmd.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

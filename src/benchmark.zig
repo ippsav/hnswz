@@ -17,6 +17,11 @@ const Store = @import("store.zig").Store;
 const HnswIndexFn = @import("hnsw.zig").HnswIndex;
 const bruteforce = @import("bruteforce.zig");
 const heap = @import("heap.zig");
+const server_mod = @import("server.zig");
+const client_mod = @import("client.zig");
+const MutableMetadata = @import("metadata_mut.zig").MutableMetadata;
+const config_mod = @import("config.zig");
+const ollama = @import("ollama.zig");
 
 /// Must match the M baked into the shipped binary (see main.zig).
 pub const M: usize = 16;
@@ -28,6 +33,8 @@ const SEARCH_BUCKET_NS: u64 = 1_000;
 const SEARCH_BUCKETS: usize = 20_000;
 const INSERT_BUCKET_NS: u64 = 10_000;
 const INSERT_BUCKETS: usize = 20_000;
+
+pub const Transport = enum { in_process, tcp };
 
 pub const Options = struct {
     num_vectors: usize,
@@ -44,6 +51,14 @@ pub const Options = struct {
     /// Upper-layer pool slots. A generous default is `num_vectors` (matches
     /// the pattern in hnsw tests); the expected mean is N / (M-1).
     upper_pool_slots: usize,
+    /// `.in_process` calls directly into `HnswIndex`; `.tcp` spawns a
+    /// `server.Server` on a worker thread and drives the workload through
+    /// a `client.Client` so the delta is the protocol overhead.
+    transport: Transport = .in_process,
+    /// When true, skip the build+search workload entirely and instead
+    /// measure PING RTT and 1-vector SEARCH_VEC RTT via TCP. Implies
+    /// `transport == .tcp`.
+    bench_protocol: bool = false,
 };
 
 /// Fixed-capacity linear-bucket latency histogram.
@@ -159,6 +174,12 @@ pub const Report = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !void {
+    if (opts.bench_protocol) return runProtocolFloor(allocator, opts, out);
+    if (opts.transport == .tcp) return runTcp(allocator, opts, out);
+    return runInProcess(allocator, opts, out);
+}
+
+fn runInProcess(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !void {
     std.debug.assert(opts.num_vectors > 0);
     std.debug.assert(opts.num_queries > 0);
     std.debug.assert(opts.dim > 0);
@@ -309,6 +330,7 @@ fn writePretty(w: *std.io.Writer, r: Report) !void {
     try w.print(
         \\hnswz benchmark
         \\  mode       {s}
+        \\  transport  {s}
         \\  seed       {d}
         \\  dim        {d}
         \\  M          {d}
@@ -321,7 +343,7 @@ fn writePretty(w: *std.io.Writer, r: Report) !void {
         \\
         \\
     , .{
-        r.build_mode, r.opts.seed, r.opts.dim,   M,
+        r.build_mode, @tagName(r.opts.transport), r.opts.seed, r.opts.dim, M,
         r.opts.num_vectors, r.opts.num_queries,
         r.opts.ef_construction, r.opts.ef_search,
         r.opts.top_k, r.opts.warmup,
@@ -401,6 +423,342 @@ fn writePhaseJson(w: *std.io.Writer, s: PhaseStats) !void {
             if (s.overflowed) "true" else "false",
         },
     );
+}
+
+// ── TCP-transport benchmark ────────────────────────────────────────────
+//
+// Spins up a Server on 127.0.0.1:0 in a worker thread, connects a
+// Client, and drives the same deterministic workload as the in-process
+// path. Report shape is unchanged so JSON diffs across transports are
+// trivial: the delta is the protocol overhead.
+
+fn tcpTransportConfig(opts: Options) config_mod.Config {
+    return .{
+        .embedder = .{
+            .provider = "ollama", // unused — no Embedder passed in
+            .base_url = "http://localhost:11434",
+            .model = "unused",
+            .dim = opts.dim,
+            .max_text_bytes = 1024,
+        },
+        .index = .{
+            .ef_construction = opts.ef_construction,
+            .ef_search = opts.ef_search,
+            .max_ef = opts.max_ef,
+            .seed = opts.seed,
+        },
+        .storage = .{
+            .data_dir = "./benchmark-serve-data",
+            .max_vectors = opts.num_vectors,
+            .upper_pool_slots = opts.upper_pool_slots,
+        },
+    };
+}
+
+const TcpHarness = struct {
+    allocator: std.mem.Allocator,
+    cfg: config_mod.Config,
+    store: Store,
+    index: HnswIndexFn(M),
+    md: MutableMetadata,
+    ws: HnswIndexFn(M).Workspace,
+    srv: server_mod.Server(M),
+    shutdown: std.atomic.Value(bool),
+    thread: ?std.Thread,
+
+    fn setUp(self: *TcpHarness, allocator: std.mem.Allocator, opts: Options) !void {
+        self.* = undefined;
+        self.allocator = allocator;
+        self.shutdown = .init(false);
+        self.thread = null;
+        self.cfg = tcpTransportConfig(opts);
+
+        self.store = try Store.init(allocator, opts.dim, opts.num_vectors);
+        self.index = try HnswIndexFn(M).init(allocator, &self.store, .{
+            .max_vectors = opts.num_vectors,
+            .max_upper_slots = opts.upper_pool_slots,
+            .ef_construction = opts.ef_construction,
+            .seed = opts.seed,
+        });
+        self.md = MutableMetadata.init();
+        self.ws = try HnswIndexFn(M).Workspace.init(allocator, opts.num_vectors, opts.max_ef);
+
+        self.srv = try server_mod.Server(M).init(
+            allocator,
+            &self.store,
+            &self.index,
+            &self.md,
+            &self.ws,
+            null, // no embedder — benchmark uses *_VEC opcodes only
+            &self.cfg,
+            .{
+                .listen_addr = "127.0.0.1",
+                .listen_port = 0,
+                .max_connections = 4,
+                .max_frame_bytes = protocol_mod.MAX_FRAME_BYTES_DEFAULT,
+                .idle_timeout_secs = 0,
+                .auto_snapshot_secs = 0,
+                .reuse_address = true,
+                .skip_final_snapshot = true,
+            },
+        );
+    }
+
+    fn runner(self: *TcpHarness) !void {
+        try self.srv.run(&self.shutdown);
+    }
+
+    fn start(self: *TcpHarness) !void {
+        self.thread = try std.Thread.spawn(.{}, runner, .{self});
+    }
+
+    fn tearDown(self: *TcpHarness) void {
+        self.shutdown.store(true, .monotonic);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        self.srv.deinit();
+        self.ws.deinit(self.allocator);
+        self.md.deinit(self.allocator);
+        self.index.deinit();
+        self.store.deinit(self.allocator);
+    }
+};
+
+const protocol_mod = @import("protocol.zig");
+
+fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !void {
+    std.debug.assert(opts.num_vectors > 0);
+    std.debug.assert(opts.num_queries > 0);
+    std.debug.assert(opts.dim > 0);
+    std.debug.assert(opts.top_k > 0);
+    std.debug.assert(opts.top_k <= opts.ef_search);
+    std.debug.assert(opts.max_ef >= opts.ef_construction);
+    std.debug.assert(opts.max_ef >= opts.ef_search);
+    std.debug.assert(opts.num_vectors >= opts.top_k);
+
+    if (builtin.mode == .Debug) {
+        std.debug.print(
+            \\WARNING: benchmark compiled in Debug mode. Results are NOT meaningful.
+            \\         Rebuild with `zig build -Doptimize=ReleaseFast` for real numbers.
+            \\
+        , .{});
+    }
+
+    var h: TcpHarness = undefined;
+    try h.setUp(allocator, opts);
+    defer h.tearDown();
+    try h.start();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", h.srv.bound_port);
+    var client = try client_mod.Client.connect(allocator, addr, .{
+        .recv_buf_size = 4 * 1024 * 1024,
+        .send_buf_size = 4 * 1024 * 1024,
+    });
+    defer client.deinit();
+
+    // Deterministic vector / query generation — same algorithm, same
+    // seed as in_process.
+    const query_buf = try allocator.alloc(f32, opts.num_queries * opts.dim);
+    defer allocator.free(query_buf);
+    const vec_buf = try allocator.alloc(f32, opts.num_vectors * opts.dim);
+    defer allocator.free(vec_buf);
+
+    {
+        var prng = std.Random.DefaultPrng.init(opts.seed);
+        const random = prng.random();
+        for (0..opts.num_vectors) |i| {
+            const slot = vec_buf[i * opts.dim ..][0..opts.dim];
+            for (slot) |*x| x.* = random.float(f32) * 2.0 - 1.0;
+            bruteforce.normalize(slot);
+        }
+        for (0..opts.num_queries) |qi| {
+            const slot = query_buf[qi * opts.dim ..][0..opts.dim];
+            for (slot) |*x| x.* = random.float(f32) * 2.0 - 1.0;
+            bruteforce.normalize(slot);
+        }
+    }
+
+    // ── build phase (client inserts) ────────────────────────────────
+
+    var build_hist = try Histogram.init(allocator, INSERT_BUCKETS, INSERT_BUCKET_NS);
+    defer build_hist.deinit();
+
+    var build_wall = try std.time.Timer.start();
+    for (0..opts.num_vectors) |i| {
+        const v = vec_buf[i * opts.dim ..][0..opts.dim];
+        var op = try std.time.Timer.start();
+        _ = try client.insertVec(v);
+        build_hist.record(op.read());
+    }
+    const build_wall_ns = build_wall.read();
+    const build_stats = phaseStatsFrom(&build_hist, build_wall_ns);
+
+    // ── recall (optional) via the server's own Store for brute force ──
+
+    var truth_ids: ?[]u32 = null;
+    defer if (truth_ids) |t| allocator.free(t);
+    if (opts.validate) {
+        const truth = try allocator.alloc(u32, opts.num_queries * opts.top_k);
+        truth_ids = truth;
+        for (0..opts.num_queries) |qi| {
+            const q = query_buf[qi * opts.dim ..][0..opts.dim];
+            const bf = try bruteforce.search(&h.store, q, opts.top_k, allocator);
+            defer allocator.free(bf);
+            const got = @min(opts.top_k, bf.len);
+            for (0..got) |i| truth[qi * opts.top_k + i] = bf[i].id;
+            for (got..opts.top_k) |i| truth[qi * opts.top_k + i] = std.math.maxInt(u32);
+        }
+    }
+
+    // ── search phase (client searches) ──────────────────────────────
+
+    const got_ids = try allocator.alloc(u32, opts.top_k);
+    defer allocator.free(got_ids);
+
+    // warmup
+    const warmup_n = @min(opts.warmup, opts.num_queries);
+    for (0..warmup_n) |qi| {
+        const q = query_buf[qi * opts.dim ..][0..opts.dim];
+        const r = try client.searchVec(q, @intCast(opts.top_k), @intCast(opts.ef_search));
+        client.freeSearchResults(r);
+    }
+
+    var search_hist = try Histogram.init(allocator, SEARCH_BUCKETS, SEARCH_BUCKET_NS);
+    defer search_hist.deinit();
+
+    var recall_sum: f64 = 0;
+    var search_wall = try std.time.Timer.start();
+    for (0..opts.num_queries) |qi| {
+        const q = query_buf[qi * opts.dim ..][0..opts.dim];
+        var op = try std.time.Timer.start();
+        const results = try client.searchVec(q, @intCast(opts.top_k), @intCast(opts.ef_search));
+        search_hist.record(op.read());
+        defer client.freeSearchResults(results);
+
+        if (truth_ids) |truth| {
+            for (results, 0..) |r, i| got_ids[i] = r.id;
+            const this_truth = truth[qi * opts.top_k .. (qi + 1) * opts.top_k];
+            recall_sum += bruteforce.computeRecall(this_truth, got_ids[0..results.len]);
+        }
+    }
+    const search_wall_ns = search_wall.read();
+    const search_stats = phaseStatsFrom(&search_hist, search_wall_ns);
+
+    const recall: ?f32 = if (opts.validate)
+        @as(f32, @floatCast(recall_sum / @as(f64, @floatFromInt(opts.num_queries))))
+    else
+        null;
+
+    const report: Report = .{
+        .opts = opts,
+        .build_mode = @tagName(builtin.mode),
+        .build = build_stats,
+        .upper_used = h.index.upper_used,
+        .search = search_stats,
+        .recall_at_k = recall,
+    };
+
+    if (opts.json) try writeJson(out, report) else try writePretty(out, report);
+    try out.flush();
+}
+
+// ── protocol-floor micro-benchmark ────────────────────────────────────
+//
+// Two phases, both reported with the same PhaseStats shape:
+//   1. PING RTT  — bounds the protocol floor (syscalls + framing).
+//   2. SEARCH_VEC RTT with 1 stored vector — bounds floor + minimal
+//      HNSW work.
+
+fn runProtocolFloor(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !void {
+    std.debug.assert(opts.dim > 0);
+    std.debug.assert(opts.num_queries > 0);
+
+    if (builtin.mode == .Debug) {
+        std.debug.print(
+            \\WARNING: benchmark compiled in Debug mode. Results are NOT meaningful.
+            \\         Rebuild with `zig build -Doptimize=ReleaseFast` for real numbers.
+            \\
+        , .{});
+    }
+
+    var h: TcpHarness = undefined;
+    var probe_opts = opts;
+    probe_opts.num_vectors = @max(opts.num_vectors, 1);
+    try h.setUp(allocator, probe_opts);
+    defer h.tearDown();
+    try h.start();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", h.srv.bound_port);
+    var client = try client_mod.Client.connect(allocator, addr, .{});
+    defer client.deinit();
+
+    // Prime the store so SEARCH_VEC has something to return.
+    const vec = try allocator.alloc(f32, opts.dim);
+    defer allocator.free(vec);
+    {
+        var prng = std.Random.DefaultPrng.init(opts.seed);
+        const random = prng.random();
+        for (vec) |*x| x.* = random.float(f32) * 2.0 - 1.0;
+        bruteforce.normalize(vec);
+    }
+    _ = try client.insertVec(vec);
+
+    // Warmup
+    var k: usize = 0;
+    while (k < opts.warmup) : (k += 1) try client.ping();
+
+    // ── PING RTT ───────────────────────────────────────────────────
+
+    var ping_hist = try Histogram.init(allocator, SEARCH_BUCKETS, SEARCH_BUCKET_NS);
+    defer ping_hist.deinit();
+    var ping_wall = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < opts.num_queries) : (i += 1) {
+        var op = try std.time.Timer.start();
+        try client.ping();
+        ping_hist.record(op.read());
+    }
+    const ping_wall_ns = ping_wall.read();
+    const ping_stats = phaseStatsFrom(&ping_hist, ping_wall_ns);
+
+    // ── SEARCH_VEC RTT ─────────────────────────────────────────────
+
+    var search_hist = try Histogram.init(allocator, SEARCH_BUCKETS, SEARCH_BUCKET_NS);
+    defer search_hist.deinit();
+    var search_wall = try std.time.Timer.start();
+    i = 0;
+    while (i < opts.num_queries) : (i += 1) {
+        var op = try std.time.Timer.start();
+        const r = try client.searchVec(vec, 1, @intCast(opts.ef_search));
+        search_hist.record(op.read());
+        client.freeSearchResults(r);
+    }
+    const search_wall_ns = search_wall.read();
+    const search_stats = phaseStatsFrom(&search_hist, search_wall_ns);
+
+    // Build a Report that reuses the existing formatters. `build`
+    // carries the PING stats; `search` carries the SEARCH stats.
+    var floor_opts = probe_opts;
+    floor_opts.num_vectors = 1; // PhaseStats report 'inserts' as PING count in this mode
+    floor_opts.transport = .tcp;
+    const report: Report = .{
+        .opts = floor_opts,
+        .build_mode = @tagName(builtin.mode),
+        .build = ping_stats,
+        .upper_used = h.index.upper_used,
+        .search = search_stats,
+        .recall_at_k = null,
+    };
+
+    if (opts.json) {
+        try out.writeAll("# NOTE: bench_protocol — 'build' phase is PING RTT, 'search' is SEARCH_VEC RTT.\n");
+        try writeJson(out, report);
+    } else {
+        try out.writeAll("hnswz benchmark — protocol floor (transport=tcp)\n");
+        try out.writeAll("  'Build phase' below is PING RTT; 'Search phase' is SEARCH_VEC RTT.\n\n");
+        try writePretty(out, report);
+    }
+    try out.flush();
 }
 
 // ── tests ──────────────────────────────────────────────────────────────
@@ -488,4 +846,61 @@ test "run benchmark with tiny params produces pretty output" {
     try testing.expect(std.mem.indexOf(u8, out, "Build phase") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Search phase") != null);
     try testing.expect(std.mem.indexOf(u8, out, "recall@") == null); // validate=false
+}
+
+test "run benchmark over TCP transport with tiny params" {
+    var buf: [16384]u8 = undefined;
+    var fixed = std.io.Writer.fixed(&buf);
+
+    const opts: Options = .{
+        .num_vectors = 30,
+        .num_queries = 10,
+        .dim = 16,
+        .ef_construction = 20,
+        .ef_search = 20,
+        .max_ef = 20,
+        .top_k = 5,
+        .seed = 7,
+        .warmup = 2,
+        .validate = true,
+        .json = false,
+        .upper_pool_slots = 30,
+        .transport = .tcp,
+        .bench_protocol = false,
+    };
+    try run(testing.allocator, opts, &fixed);
+
+    const out = buf[0..fixed.end];
+    try testing.expect(std.mem.indexOf(u8, out, "transport  tcp") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Build phase") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Search phase") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "recall@") != null);
+}
+
+test "bench_protocol produces PING and SEARCH phase stats" {
+    var buf: [16384]u8 = undefined;
+    var fixed = std.io.Writer.fixed(&buf);
+
+    const opts: Options = .{
+        .num_vectors = 1,
+        .num_queries = 20,
+        .dim = 8,
+        .ef_construction = 10,
+        .ef_search = 10,
+        .max_ef = 10,
+        .top_k = 1,
+        .seed = 9,
+        .warmup = 2,
+        .validate = false,
+        .json = false,
+        .upper_pool_slots = 2,
+        .transport = .tcp,
+        .bench_protocol = true,
+    };
+    try run(testing.allocator, opts, &fixed);
+
+    const out = buf[0..fixed.end];
+    try testing.expect(std.mem.indexOf(u8, out, "protocol floor") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "PING RTT") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "SEARCH_VEC RTT") != null);
 }

@@ -54,7 +54,7 @@ Pass the path with `--config <path>` or set the `HNSWZ_CONFIG` environment varia
 
 ## Usage
 
-Three subcommands: `build`, `query`, `benchmark`.
+Five subcommands: `build`, `query`, `benchmark`, `serve`, `client`.
 
 ### `build` — ingest a corpus
 
@@ -98,3 +98,111 @@ Flags:
 | `--json` | off | machine-readable output |
 
 > Run release-mode for meaningful numbers: `zig build -Doptimize=ReleaseFast`.
+
+### `serve` — long-running TCP database
+
+Loads (or creates, if `storage.data_dir` is empty) an index and serves
+`INSERT / DELETE / REPLACE / GET / SEARCH / STATS / SNAPSHOT` operations
+over a custom binary TCP protocol. Designed for performance first: the
+dominant payload is the raw f32 vector blob (dim=4096 × 4 B = 16 KiB), and
+any text framing (JSON, SQL, RESP text mode) would be a measurable tax on
+both latency and memory.
+
+```sh
+hnswz serve --config config.json --listen 127.0.0.1:9000
+# or
+zig build serve -- --config config.json --listen 127.0.0.1:9000 --auto-snapshot-secs 60
+```
+
+Flags:
+
+| flag | default | description |
+|---|---|---|
+| `--listen <host:port>` | `127.0.0.1:9000` | bind address |
+| `--auto-snapshot-secs <n>` | `0` (off) | periodic snapshot cadence |
+| `--max-connections <n>` | `64` | concurrent connection cap |
+| `--max-frame-bytes <n>` | `64 MiB` | reject frames larger than this |
+| `--idle-timeout-secs <n>` | `60` | close idle connections |
+
+**Wire format.** Every frame is a 9-byte header (`u32 body_len | u8
+opcode_or_status | u32 req_id`) followed by an opcode-specific payload.
+All multi-byte fields are little-endian, matching the on-disk HVSF/HGRF
+formats. See [src/protocol.zig](src/protocol.zig) for the authoritative
+spec and every opcode's exact byte layout.
+
+**Concurrency.** Single-threaded `poll(2)` reactor. `HnswIndex` and its
+`Workspace` are not thread-safe, and a global mutex gives zero throughput
+win over serial dispatch; the reactor gets the same throughput without
+locks or per-thread scratch duplication. Partial reads AND partial writes
+are handled — the connection state machine survives short `read`/`write`
+returns and kernel back-pressure.
+
+**Known limitation.** The `_TEXT` opcodes (`INSERT_TEXT`, `SEARCH_TEXT`,
+`REPLACE_TEXT`) synchronously call Ollama's embed HTTP endpoint from the
+reactor thread, which means a slow embed stalls all connections. Clients
+that need throughput should pre-compute vectors and use the `_VEC`
+variants instead. (WIP)
+
+**Durability.** Writes live in memory until a snapshot fires. Snapshots
+are triggered explicitly via the `SNAPSHOT` opcode, on the
+`--auto-snapshot-secs` cadence, or once on clean shutdown (`SIGINT` /
+`SIGTERM`). Between snapshots, a crash loses recent writes; a write-ahead
+log is V2. Do NOT run `hnswz build` while `hnswz serve` is live on the
+same `data_dir` — no file locking yet.
+
+### `client` — one-shot probe against a running `serve`
+
+A companion to `serve` that sends exactly one operation, prints the
+response, and exits. Useful for smoke tests, scripting, and ad-hoc
+poking. Reuses [src/client.zig](src/client.zig) as its implementation, so
+there's no separate client code path to keep in sync.
+
+```sh
+hnswz serve --config config.json --listen 127.0.0.1:9000 &
+
+hnswz client --connect 127.0.0.1:9000 ping
+hnswz client --connect 127.0.0.1:9000 stats
+hnswz client --connect 127.0.0.1:9000 insert-text "machine learning"
+hnswz client --connect 127.0.0.1:9000 search-text "ML" --top-k 5
+hnswz client --connect 127.0.0.1:9000 get 0 --full-vec
+hnswz client --connect 127.0.0.1:9000 delete 0
+hnswz client --connect 127.0.0.1:9000 snapshot
+
+# Raw vectors come from a file, stdin, or (for demos) a comma-list.
+python -c 'import numpy; numpy.random.rand(128).astype("<f4").tofile("q.f32")'
+hnswz client ... search-vec --dim 128 --from-file q.f32 --top-k 10
+hnswz client ... insert-vec --dim 4 --literal "1.0,0,0,0"
+
+# Machine-readable output for piping into jq / scripts.
+hnswz client ... stats --json
+hnswz client ... search-text "ML" --top-k 5 --json | jq '.results[0].id'
+```
+
+`--dim` is auto-discovered from `STATS` when omitted on `get`, but the
+`*-vec` verbs need it up front to know how many bytes the vector
+payload is. `--ef` defaults to `max(top_k, 10)`. Exit codes are 0 on
+`status=OK`, 1 on server error (with the diagnostic printed), and 2 on
+CLI usage errors.
+
+### Benchmark — in-process vs TCP
+
+The same `benchmark` subcommand drives either transport:
+
+```sh
+# baseline (direct HnswIndex calls)
+zig build -Doptimize=ReleaseFast
+zig build benchmark -- --num-vectors 50000 --json > in-process.json
+
+# over the wire
+zig build benchmark -- --transport tcp --num-vectors 50000 --json > tcp.json
+
+# diff the search phase — the delta is the protocol overhead
+diff -u <(jq .search in-process.json) <(jq .search tcp.json)
+```
+
+A dedicated protocol-floor micro-benchmark measures just the framing
+round-trip without any HNSW cost:
+
+```sh
+zig build benchmark -- --bench-protocol --num-queries 10000
+```

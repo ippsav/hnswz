@@ -17,7 +17,10 @@ pub fn main() !void {
     defer args.deinit(allocator);
 
     switch (args.subcommand) {
-        .build, .query => {
+        .client => {
+            try runClient(allocator, &args);
+        },
+        .build, .query, .serve => {
             const path = args.config_path orelse {
                 log.err("{s} requires --config <path> (or set {s})", .{
                     @tagName(args.subcommand), cli.CONFIG_ENV_VAR,
@@ -53,7 +56,10 @@ pub fn main() !void {
                     const top_k = args.top_k orelse cli.DEFAULT_TOP_K;
                     try runQuery(allocator, cfg, top_k);
                 },
-                .benchmark => unreachable,
+                .serve => {
+                    try runServe(allocator, cfg, &args);
+                },
+                .benchmark, .client => unreachable,
             }
         },
         .benchmark => {
@@ -331,6 +337,147 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
     }
 }
 
+// ── serve ─────────────────────────────────────────────────────────────
+
+/// Split "host:port" on the LAST colon so IPv6 literals (when supported
+/// in the future) don't get mis-parsed. Returns null on malformed input.
+fn splitHostPort(s: []const u8) ?struct { host: []const u8, port: u16 } {
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    if (colon == 0 or colon == s.len - 1) return null;
+    const host = s[0..colon];
+    const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch return null;
+    return .{ .host = host, .port = port };
+}
+
+fn runServe(
+    allocator: std.mem.Allocator,
+    cfg: *const hnswz.config.Config,
+    args: *const cli.Args,
+) !void {
+    const Index = hnswz.HnswIndex(M);
+    const Server = hnswz.server.Server(M);
+
+    // Resolve listen host:port
+    const listen = args.serve_listen orelse "127.0.0.1:9000";
+    const parts = splitHostPort(listen) orelse {
+        log.err("--listen must be host:port (got '{s}')", .{listen});
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    };
+
+    // Ensure data_dir exists so snapshot calls don't fail.
+    std.fs.cwd().makePath(cfg.storage.data_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            log.err("cannot create data_dir '{s}': {s}", .{ cfg.storage.data_dir, @errorName(err) });
+            std.process.exit(1);
+        },
+    };
+    var data_dir = try std.fs.cwd().openDir(cfg.storage.data_dir, .{});
+    defer data_dir.close();
+
+    // Try to load existing store+graph+metadata. If the files are absent
+    // we start with a fresh empty index sized from config.
+    const had_snapshot = blk: {
+        data_dir.access(cfg.storage.vectors_file, .{}) catch break :blk false;
+        data_dir.access(cfg.storage.graph_file, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    var store: hnswz.Store = if (had_snapshot)
+        try hnswz.Store.load(allocator, data_dir, cfg.storage.vectors_file, cfg.storage.max_vectors)
+    else
+        try hnswz.Store.init(allocator, cfg.embedder.dim, cfg.storage.max_vectors);
+    defer store.deinit(allocator);
+
+    if (store.dim != cfg.embedder.dim) {
+        log.err("vectors file dim ({d}) != config embedder.dim ({d})", .{ store.dim, cfg.embedder.dim });
+        std.process.exit(1);
+    }
+
+    const upper_slots: usize = if (had_snapshot) blk: {
+        const sz = try Index.scanSize(data_dir, cfg.storage.graph_file);
+        break :blk @max(cfg.storage.upper_pool_slots, sz.upper_slots);
+    } else @max(cfg.storage.upper_pool_slots, cfg.storage.max_vectors);
+
+    var index: Index = if (had_snapshot)
+        try Index.load(allocator, &store, data_dir, cfg.storage.graph_file, .{
+            .max_vectors = cfg.storage.max_vectors,
+            .max_upper_slots = upper_slots,
+            .ef_construction = cfg.index.ef_construction,
+            .seed = cfg.index.seed,
+        })
+    else
+        try Index.init(allocator, &store, .{
+            .max_vectors = cfg.storage.max_vectors,
+            .max_upper_slots = upper_slots,
+            .ef_construction = cfg.index.ef_construction,
+            .seed = cfg.index.seed,
+        });
+    defer index.deinit();
+
+    // Populate MutableMetadata from the static sidecar if present.
+    var mm = hnswz.metadata_mut.MutableMetadata.init();
+    defer mm.deinit(allocator);
+    try mm.ensureCapacity(allocator, cfg.storage.max_vectors);
+    if (had_snapshot) {
+        data_dir.access(cfg.storage.metadata_file, .{}) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        if (data_dir.access(cfg.storage.metadata_file, .{})) |_| {
+            var static_md = try hnswz.metadata.load(allocator, data_dir, cfg.storage.metadata_file);
+            defer static_md.deinit(allocator);
+            if (static_md.count != store.live_count) {
+                log.err("metadata count ({d}) != vectors count ({d})", .{ static_md.count, store.live_count });
+                std.process.exit(1);
+            }
+            for (0..static_md.count) |i| {
+                try mm.setAt(allocator, @intCast(i), static_md.get(@intCast(i)));
+            }
+        } else |_| {}
+    }
+
+    var ws = try Index.Workspace.init(allocator, cfg.storage.max_vectors, cfg.index.max_ef);
+    defer ws.deinit(allocator);
+
+    // Embedder: Ollama if configured. Text opcodes fail cleanly otherwise.
+    var maybe_client: ?hnswz.OllamaClient = null;
+    defer if (maybe_client) |*c| c.deinit();
+    var embedder: ?hnswz.Embedder = null;
+    if (std.mem.eql(u8, cfg.embedder.provider, "ollama")) {
+        maybe_client = try hnswz.OllamaClient.init(
+            allocator,
+            cfg.embedder.model,
+            cfg.embedder.base_url,
+            .{ .max_text_bytes = cfg.embedder.max_text_bytes, .dim = cfg.embedder.dim },
+        );
+        embedder = maybe_client.?.embedder();
+    }
+
+    const opts: hnswz.server.ServeOptions = .{
+        .listen_addr = parts.host,
+        .listen_port = parts.port,
+        .max_connections = if (args.serve_max_connections) |v| @intCast(v) else 64,
+        .max_frame_bytes = if (args.serve_max_frame_bytes) |v| @intCast(v) else hnswz.protocol.MAX_FRAME_BYTES_DEFAULT,
+        .idle_timeout_secs = args.serve_idle_timeout_secs orelse 60,
+        .auto_snapshot_secs = args.serve_auto_snapshot_secs orelse 0,
+        .reuse_address = true,
+    };
+
+    var server_inst = try Server.init(allocator, &store, &index, &mm, &ws, embedder, cfg, opts);
+    defer server_inst.deinit();
+
+    var shutdown_flag: std.atomic.Value(bool) = .init(false);
+    hnswz.server.installSignalHandlers(&shutdown_flag);
+
+    log.info("serve: listening on {s}:{d} (loaded={d} vectors)", .{
+        parts.host, server_inst.bound_port, store.live_count,
+    });
+
+    try server_inst.run(&shutdown_flag);
+    log.info("serve: shut down cleanly", .{});
+}
+
 // ── benchmark ─────────────────────────────────────────────────────────
 
 /// Hardcoded benchmark defaults. These apply when neither CLI flag nor
@@ -407,6 +554,11 @@ fn runBenchmark(
 
     const max_ef = @max(ef_construction, ef_search);
 
+    const transport: hnswz.benchmark.Transport = switch (args.bench_transport orelse .in_process) {
+        .in_process => .in_process,
+        .tcp => .tcp,
+    };
+
     const opts: hnswz.benchmark.Options = .{
         .num_vectors = num_vectors,
         .num_queries = num_queries,
@@ -422,6 +574,8 @@ fn runBenchmark(
         // Generous default that matches the per-node slot budget used in
         // the hnsw tests. Expected mean is num_vectors / (M-1).
         .upper_pool_slots = num_vectors,
+        .transport = transport,
+        .bench_protocol = args.bench_protocol,
     };
 
     var out_buf: [8192]u8 = undefined;
@@ -431,9 +585,699 @@ fn runBenchmark(
     try hnswz.benchmark.run(allocator, opts, out);
 }
 
+// ── client ────────────────────────────────────────────────────────────
+
+fn runClient(allocator: std.mem.Allocator, args: *const cli.Args) !void {
+    const verb = args.client_verb orelse {
+        log.err("'hnswz client' requires a verb (e.g. 'ping', 'stats', 'insert-text ...')", .{});
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    };
+
+    const connect = args.client_connect orelse "127.0.0.1:9000";
+    const parts = splitHostPort(connect) orelse {
+        log.err("--connect must be host:port (got '{s}')", .{connect});
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    };
+
+    const addr = std.net.Address.parseIp(parts.host, parts.port) catch |err| {
+        log.err("invalid connect address '{s}': {s}", .{ connect, @errorName(err) });
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    };
+
+    var client = hnswz.client.Client.connect(allocator, addr, .{
+        // Generous: STATS needs tiny, GET at dim=4096 is ~16 KiB, SEARCH
+        // with top_k=100 and name<=256 is ~27 KiB.
+        .recv_buf_size = 4 * 1024 * 1024,
+        .send_buf_size = 4 * 1024 * 1024,
+    }) catch |err| {
+        log.err("cannot connect to {s}: {s}", .{ connect, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer client.deinit();
+
+    var out_buf: [8192]u8 = undefined;
+    var stdout_file_writer = std.fs.File.stdout().writer(&out_buf);
+    const out = &stdout_file_writer.interface;
+
+    runClientVerb(allocator, &client, args, verb, out) catch |err| switch (err) {
+        error.ClientVerbFailed => {
+            out.flush() catch {};
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+    try out.flush();
+}
+
+/// Split out from `runClient` so tests can drive it directly with an
+/// already-connected client and a fixed-buffer writer — no real
+/// subprocess, no stdout capture gymnastics.
+///
+/// On "expected" failures (server returned non-OK, user supplied bad
+/// arguments, malformed vector input), the diagnostic is written to
+/// `out` and `error.ClientVerbFailed` is returned. The outer `runClient`
+/// maps that to an exit code of 1. Tests assert on `out`'s contents.
+fn runClientVerb(
+    allocator: std.mem.Allocator,
+    client: *hnswz.client.Client,
+    args: *const cli.Args,
+    verb: cli.ClientVerb,
+    out: *std.io.Writer,
+) !void {
+    const json_mode = args.client_json;
+
+    switch (verb) {
+        .ping => {
+            client.ping() catch |err| return reportVerbError(err, client, out, json_mode);
+            if (json_mode) try out.writeAll("{\"ok\":true}\n") else try out.writeAll("OK\n");
+        },
+        .stats => {
+            const s = client.stats() catch |err| return reportVerbError(err, client, out, json_mode);
+            try writeStats(out, s, json_mode);
+        },
+        .snapshot => {
+            const elapsed = client.snapshot() catch |err| return reportVerbError(err, client, out, json_mode);
+            if (json_mode) {
+                try out.print("{{\"elapsed_ns\":{d}}}\n", .{elapsed});
+            } else {
+                try out.print("snapshot: {d} ns\n", .{elapsed});
+            }
+        },
+        .delete => {
+            const id = try requireIdPos(args.client_pos0, out, json_mode);
+            client.delete(id) catch |err| return reportVerbError(err, client, out, json_mode);
+            if (json_mode) try out.writeAll("{\"ok\":true}\n") else try out.writeAll("OK\n");
+        },
+        .get => {
+            const id = try requireIdPos(args.client_pos0, out, json_mode);
+            const dim = args.client_dim orelse (client.stats() catch |err|
+                return reportVerbError(err, client, out, json_mode)).dim;
+            const got = client.get(id, dim) catch |err| return reportVerbError(err, client, out, json_mode);
+            defer allocator.free(got.name);
+            defer allocator.free(got.vec);
+            try writeGet(out, got.name, got.vec, args.client_full_vec, json_mode);
+        },
+        .insert_text => {
+            const text = try requireTextPos(args.client_pos0, out, json_mode);
+            const id = client.insertText(text) catch |err| return reportVerbError(err, client, out, json_mode);
+            try writeIdOnly(out, id, json_mode);
+        },
+        .replace_text => {
+            const id = try requireIdPos(args.client_pos0, out, json_mode);
+            const text = try requireTextPos(args.client_pos1, out, json_mode);
+            client.replaceText(id, text) catch |err| return reportVerbError(err, client, out, json_mode);
+            if (json_mode) try out.writeAll("{\"ok\":true}\n") else try out.writeAll("OK\n");
+        },
+        .search_text => {
+            const text = try requireTextPos(args.client_pos0, out, json_mode);
+            const top_k: u16 = @intCast(args.top_k orelse cli.DEFAULT_TOP_K);
+            const ef: u16 = if (args.client_ef) |e| @intCast(e) else @max(top_k, 10);
+            const results = client.searchText(text, top_k, ef) catch |err|
+                return reportVerbError(err, client, out, json_mode);
+            defer client.freeSearchResults(results);
+            try writeSearchResults(out, results, json_mode);
+        },
+        .insert_vec => {
+            const dim = try resolveDim(args, client, out, json_mode);
+            const vec = try readVec(allocator, args, dim, out, json_mode);
+            defer allocator.free(vec);
+            const id = client.insertVec(vec) catch |err| return reportVerbError(err, client, out, json_mode);
+            try writeIdOnly(out, id, json_mode);
+        },
+        .replace_vec => {
+            const id = try requireIdPos(args.client_pos0, out, json_mode);
+            const dim = try resolveDim(args, client, out, json_mode);
+            const vec = try readVec(allocator, args, dim, out, json_mode);
+            defer allocator.free(vec);
+            client.replaceVec(id, vec) catch |err| return reportVerbError(err, client, out, json_mode);
+            if (json_mode) try out.writeAll("{\"ok\":true}\n") else try out.writeAll("OK\n");
+        },
+        .search_vec => {
+            const dim = try resolveDim(args, client, out, json_mode);
+            const vec = try readVec(allocator, args, dim, out, json_mode);
+            defer allocator.free(vec);
+            const top_k: u16 = @intCast(args.top_k orelse cli.DEFAULT_TOP_K);
+            const ef: u16 = if (args.client_ef) |e| @intCast(e) else @max(top_k, 10);
+            const results = client.searchVec(vec, top_k, ef) catch |err|
+                return reportVerbError(err, client, out, json_mode);
+            defer client.freeSearchResults(results);
+            try writeSearchResults(out, results, json_mode);
+        },
+    }
+}
+
+// ── client: helpers ───────────────────────────────────────────────────
+
+fn requireIdPos(maybe: ?[]u8, out: *std.io.Writer, json_mode: bool) !u32 {
+    const s = maybe orelse return writeUsageError(out, json_mode, "verb requires an <id> positional argument");
+    return std.fmt.parseInt(u32, s, 10) catch {
+        return writeUsageError(out, json_mode, "<id> must be a non-negative integer");
+    };
+}
+
+fn requireTextPos(maybe: ?[]u8, out: *std.io.Writer, json_mode: bool) ![]const u8 {
+    return maybe orelse return writeUsageError(out, json_mode, "verb requires a <text> positional argument");
+}
+
+fn resolveDim(args: *const cli.Args, client: *hnswz.client.Client, out: *std.io.Writer, json_mode: bool) !usize {
+    if (args.client_dim) |d| return d;
+    const s = client.stats() catch |err| return reportVerbError(err, client, out, json_mode);
+    return s.dim;
+}
+
+/// Materialize a `[]f32` of length `dim` from whichever source the user
+/// picked. Caller must free. Accepts exactly one of --from-file /
+/// --from-stdin / --literal.
+fn readVec(
+    allocator: std.mem.Allocator,
+    args: *const cli.Args,
+    dim: usize,
+    out: *std.io.Writer,
+    json_mode: bool,
+) ![]f32 {
+    const have_file = args.client_from_file != null;
+    const have_stdin = args.client_from_stdin;
+    const have_literal = args.client_literal != null;
+    const picked: u2 = @as(u2, @intFromBool(have_file)) + @as(u2, @intFromBool(have_stdin)) + @as(u2, @intFromBool(have_literal));
+    if (picked == 0) {
+        return writeUsageError(out, json_mode, "vector verbs require one of --from-file, --from-stdin, or --literal");
+    }
+    if (picked > 1) {
+        return writeUsageError(out, json_mode, "--from-file, --from-stdin, and --literal are mutually exclusive");
+    }
+
+    const vec = try allocator.alloc(f32, dim);
+    errdefer allocator.free(vec);
+
+    if (args.client_from_file) |path| {
+        const file = std.fs.cwd().openFile(path, .{}) catch {
+            return writeUsageError(out, json_mode, "--from-file: cannot open file");
+        };
+        defer file.close();
+        const bytes = std.mem.sliceAsBytes(vec);
+        const n = file.readAll(bytes) catch {
+            return writeUsageError(out, json_mode, "--from-file: read failed");
+        };
+        if (n != bytes.len) {
+            return writeUsageError(out, json_mode, "--from-file: byte count does not match dim * 4");
+        }
+        return vec;
+    }
+    if (have_stdin) {
+        const bytes = std.mem.sliceAsBytes(vec);
+        var read_buf: [4096]u8 = undefined;
+        var stdin = std.fs.File.stdin().readerStreaming(&read_buf);
+        const r = &stdin.interface;
+        r.readSliceAll(bytes) catch {
+            return writeUsageError(out, json_mode, "--from-stdin: read failed or ended early");
+        };
+        return vec;
+    }
+    // literal: comma-separated floats
+    const literal = args.client_literal.?;
+    var i: usize = 0;
+    var it = std.mem.splitScalar(u8, literal, ',');
+    while (it.next()) |token| {
+        const trimmed = std.mem.trim(u8, token, " \t");
+        if (trimmed.len == 0) continue;
+        if (i >= dim) {
+            return writeUsageError(out, json_mode, "--literal has more values than dim");
+        }
+        vec[i] = std.fmt.parseFloat(f32, trimmed) catch {
+            return writeUsageError(out, json_mode, "--literal value is not a valid float");
+        };
+        i += 1;
+    }
+    if (i != dim) {
+        return writeUsageError(out, json_mode, "--literal count does not match dim");
+    }
+    return vec;
+}
+
+// ── client: output formatters ─────────────────────────────────────────
+
+fn writeUsageError(out: *std.io.Writer, json_mode: bool, msg: []const u8) error{ClientVerbFailed} {
+    if (json_mode) {
+        out.print("{{\"error\":\"", .{}) catch return error.ClientVerbFailed;
+        writeJsonEscaped(out, msg) catch return error.ClientVerbFailed;
+        out.writeAll("\"}\n") catch return error.ClientVerbFailed;
+    } else {
+        out.print("error: {s}\n", .{msg}) catch return error.ClientVerbFailed;
+    }
+    return error.ClientVerbFailed;
+}
+
+fn reportVerbError(
+    err: anyerror,
+    client: *hnswz.client.Client,
+    out: *std.io.Writer,
+    json_mode: bool,
+) error{ClientVerbFailed} {
+    if (err != error.ServerError) {
+        if (json_mode) {
+            out.print("{{\"error\":\"{s}\"}}\n", .{@errorName(err)}) catch {};
+        } else {
+            out.print("error: {s}\n", .{@errorName(err)}) catch {};
+        }
+        return error.ClientVerbFailed;
+    }
+    const status = @intFromEnum(client.last_status);
+    const msg = if (client.last_message.len > 0)
+        client.last_message
+    else
+        hnswz.protocol.statusMessage(client.last_status);
+    if (json_mode) {
+        out.print("{{\"error\":\"", .{}) catch {};
+        writeJsonEscaped(out, msg) catch {};
+        out.print("\",\"status\":{d}}}\n", .{status}) catch {};
+    } else {
+        out.print("error (status={d}): {s}\n", .{ status, msg }) catch {};
+    }
+    return error.ClientVerbFailed;
+}
+
+fn writeIdOnly(out: *std.io.Writer, id: u32, json_mode: bool) !void {
+    if (json_mode) {
+        try out.print("{{\"id\":{d}}}\n", .{id});
+    } else {
+        try out.print("id={d}\n", .{id});
+    }
+}
+
+fn writeStats(out: *std.io.Writer, s: hnswz.protocol.StatsResponse, json_mode: bool) !void {
+    if (json_mode) {
+        try out.print(
+            "{{\"proto_version\":{d},\"dim\":{d},\"M\":{d},\"live_count\":{d},\"high_water\":{d},\"upper_used\":{d},\"max_upper_slots\":{d},\"max_level\":{d},\"has_entry_point\":{s}}}\n",
+            .{
+                s.proto_version, s.dim, s.m, s.live_count, s.high_water,
+                s.upper_used,   s.max_upper_slots, s.max_level,
+                if (s.has_entry_point != 0) "true" else "false",
+            },
+        );
+    } else {
+        try out.print(
+            \\proto_version   {d}
+            \\dim             {d}
+            \\M               {d}
+            \\live_count      {d}
+            \\high_water      {d}
+            \\upper_used      {d}/{d}
+            \\max_level       {d}
+            \\has_entry_point {s}
+            \\
+        , .{
+            s.proto_version, s.dim, s.m, s.live_count, s.high_water,
+            s.upper_used,    s.max_upper_slots, s.max_level,
+            if (s.has_entry_point != 0) "yes" else "no",
+        });
+    }
+}
+
+fn writeGet(
+    out: *std.io.Writer,
+    name: []const u8,
+    vec: []const f32,
+    full_vec: bool,
+    json_mode: bool,
+) !void {
+    if (json_mode) {
+        try out.print("{{\"name\":\"", .{});
+        try writeJsonEscaped(out, name);
+        try out.writeAll("\",\"vec\":[");
+        for (vec, 0..) |x, i| {
+            if (i > 0) try out.writeAll(",");
+            try out.print("{d}", .{x});
+        }
+        try out.writeAll("]}\n");
+    } else {
+        try out.print("name={s}\n", .{name});
+        if (full_vec) {
+            for (vec, 0..) |x, i| {
+                if (i > 0) try out.writeAll(",");
+                try out.print("{d}", .{x});
+            }
+            try out.writeAll("\n");
+        } else {
+            try out.print("vec=<{d} floats; pass --full-vec to print>\n", .{vec.len});
+        }
+    }
+}
+
+fn writeSearchResults(
+    out: *std.io.Writer,
+    results: []const hnswz.client.ClientSearchResult,
+    json_mode: bool,
+) !void {
+    if (json_mode) {
+        try out.writeAll("{\"results\":[");
+        for (results, 0..) |r, i| {
+            if (i > 0) try out.writeAll(",");
+            try out.print("{{\"id\":{d},\"dist\":{d},\"name\":\"", .{ r.id, r.dist });
+            try writeJsonEscaped(out, r.name);
+            try out.writeAll("\"}");
+        }
+        try out.writeAll("]}\n");
+    } else {
+        try out.writeAll("id\tdist\tname\n");
+        for (results) |r| {
+            try out.print("{d}\t{d:.6}\t{s}\n", .{ r.id, r.dist, r.name });
+        }
+    }
+}
+
+/// Escape a string for inclusion inside a JSON "..." literal. Handles
+/// only the bare minimum (", \, control chars); sufficient for server
+/// diagnostics and short metadata names.
+fn writeJsonEscaped(out: *std.io.Writer, s: []const u8) !void {
+    for (s) |b| {
+        switch (b) {
+            '"' => try out.writeAll("\\\""),
+            '\\' => try out.writeAll("\\\\"),
+            '\n' => try out.writeAll("\\n"),
+            '\r' => try out.writeAll("\\r"),
+            '\t' => try out.writeAll("\\t"),
+            0...0x08, 0x0b, 0x0c, 0x0e...0x1f => try out.print("\\u{x:0>4}", .{b}),
+            else => try out.writeByte(b),
+        }
+    }
+}
+
 // ── tests ──────────────────────────────────────────────────────────────
 
 test {
     // Ensure cli.zig's tests get compiled when running the exe test binary.
     _ = @import("cli.zig");
+}
+
+// ── client-verb integration tests ─────────────────────────────────────
+//
+// Each test spins up a real `hnswz.server.Server` on an ephemeral port
+// with a `FakeEmbedder`, connects a `hnswz.client.Client`, and drives
+// the full `runClientVerb` path. Assertions run against a fixed-buffer
+// writer so stdout capture isn't needed.
+
+const testing = std.testing;
+
+const ClientTestCtx = struct {
+    allocator: std.mem.Allocator,
+    cfg: hnswz.config.Config,
+    store: hnswz.Store,
+    index: hnswz.HnswIndex(M),
+    md: hnswz.metadata_mut.MutableMetadata,
+    ws: hnswz.HnswIndex(M).Workspace,
+    embedder: hnswz.FakeEmbedder,
+    srv: hnswz.server.Server(M),
+    shutdown: std.atomic.Value(bool),
+    thread: ?std.Thread,
+    port: u16,
+
+    fn setUp(self: *ClientTestCtx, allocator: std.mem.Allocator, dim: usize, max_vectors: usize) !void {
+        self.* = undefined;
+        self.allocator = allocator;
+        self.shutdown = .init(false);
+        self.thread = null;
+        self.cfg = .{
+            .embedder = .{ .provider = "ollama", .base_url = "http://localhost:11434", .model = "fake", .dim = dim, .max_text_bytes = 1024 },
+            .index = .{ .ef_construction = 40, .ef_search = 40, .max_ef = 40 },
+            .storage = .{ .data_dir = "./test-client-data", .max_vectors = max_vectors },
+        };
+        self.store = try hnswz.Store.init(allocator, dim, max_vectors);
+        self.index = try hnswz.HnswIndex(M).init(allocator, &self.store, .{
+            .max_vectors = max_vectors,
+            .max_upper_slots = max_vectors,
+            .ef_construction = self.cfg.index.ef_construction,
+            .seed = self.cfg.index.seed,
+        });
+        self.md = hnswz.metadata_mut.MutableMetadata.init();
+        self.ws = try hnswz.HnswIndex(M).Workspace.init(allocator, max_vectors, self.cfg.index.max_ef);
+        self.embedder = hnswz.FakeEmbedder.init(dim, 0xabcd);
+        self.srv = try hnswz.server.Server(M).init(
+            allocator,
+            &self.store,
+            &self.index,
+            &self.md,
+            &self.ws,
+            self.embedder.embedder(),
+            &self.cfg,
+            .{
+                .listen_addr = "127.0.0.1",
+                .listen_port = 0,
+                .max_connections = 4,
+                .max_frame_bytes = 1 << 20,
+                .idle_timeout_secs = 0,
+                .auto_snapshot_secs = 0,
+                .reuse_address = true,
+                .skip_final_snapshot = true,
+            },
+        );
+        self.port = self.srv.bound_port;
+    }
+
+    fn start(self: *ClientTestCtx) !void {
+        self.thread = try std.Thread.spawn(.{}, runner, .{self});
+    }
+
+    fn runner(self: *ClientTestCtx) !void {
+        try self.srv.run(&self.shutdown);
+    }
+
+    fn tearDown(self: *ClientTestCtx) void {
+        self.shutdown.store(true, .monotonic);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        self.srv.deinit();
+        self.ws.deinit(self.allocator);
+        self.md.deinit(self.allocator);
+        self.index.deinit();
+        self.store.deinit(self.allocator);
+    }
+};
+
+fn connectClient(allocator: std.mem.Allocator, port: u16) !hnswz.client.Client {
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    return try hnswz.client.Client.connect(allocator, addr, .{});
+}
+
+test "client verb: ping prints OK" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [256]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+
+    const args: cli.Args = .{ .subcommand = .client, .client_verb = .ping };
+    try runClientVerb(testing.allocator, &client, &args, .ping, &w);
+    try testing.expectEqualStrings("OK\n", buf[0..w.end]);
+}
+
+test "client verb: stats pretty-prints dim and M" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [512]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+
+    const args: cli.Args = .{ .subcommand = .client, .client_verb = .stats };
+    try runClientVerb(testing.allocator, &client, &args, .stats, &w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "dim             4") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "M               16") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "live_count      0") != null);
+}
+
+test "client verb: stats --json emits parseable object" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [512]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+
+    const args: cli.Args = .{ .subcommand = .client, .client_verb = .stats, .client_json = true };
+    try runClientVerb(testing.allocator, &client, &args, .stats, &w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.startsWith(u8, out, "{"));
+    try testing.expect(std.mem.indexOf(u8, out, "\"dim\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"M\":16") != null);
+}
+
+test "client verb: insert-vec via --literal prints id=0" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [128]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+
+    const lit_buf = try testing.allocator.dupe(u8, "1.0,0,0,0");
+    defer testing.allocator.free(lit_buf);
+    const args: cli.Args = .{
+        .subcommand = .client,
+        .client_verb = .insert_vec,
+        .client_dim = 4,
+        .client_literal = lit_buf,
+    };
+    try runClientVerb(testing.allocator, &client, &args, .insert_vec, &w);
+    try testing.expectEqualStrings("id=0\n", buf[0..w.end]);
+}
+
+test "client verb: insert-vec + search-vec finds inserted vec" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [256]u8 = undefined;
+
+    const lit_buf = try testing.allocator.dupe(u8, "1.0,0,0,0");
+    defer testing.allocator.free(lit_buf);
+    const insert_args: cli.Args = .{
+        .subcommand = .client,
+        .client_verb = .insert_vec,
+        .client_dim = 4,
+        .client_literal = lit_buf,
+    };
+    var w1 = std.io.Writer.fixed(&buf);
+    try runClientVerb(testing.allocator, &client, &insert_args, .insert_vec, &w1);
+
+    const search_args: cli.Args = .{
+        .subcommand = .client,
+        .client_verb = .search_vec,
+        .client_dim = 4,
+        .client_literal = lit_buf[0..9],
+        .top_k = 1,
+        .client_ef = 10,
+    };
+    var w2 = std.io.Writer.fixed(&buf);
+    try runClientVerb(testing.allocator, &client, &search_args, .search_vec, &w2);
+    const out = buf[0..w2.end];
+    try testing.expect(std.mem.startsWith(u8, out, "id\tdist\tname\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "0\t0.000000") != null);
+}
+
+test "client verb: insert-vec with bad dim surfaces ServerError" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [256]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+
+    const lit_buf = try testing.allocator.dupe(u8, "1.0,2.0");
+    defer testing.allocator.free(lit_buf);
+    const args: cli.Args = .{
+        .subcommand = .client,
+        .client_verb = .insert_vec,
+        .client_dim = 2, // wrong, server expects 4
+        .client_literal = lit_buf,
+    };
+    try testing.expectError(error.ClientVerbFailed, runClientVerb(testing.allocator, &client, &args, .insert_vec, &w));
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "status=5") != null); // dim_mismatch
+}
+
+test "client verb: delete requires id positional" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [128]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+
+    const args: cli.Args = .{ .subcommand = .client, .client_verb = .delete };
+    try testing.expectError(error.ClientVerbFailed, runClientVerb(testing.allocator, &client, &args, .delete, &w));
+    try testing.expect(std.mem.indexOf(u8, buf[0..w.end], "<id>") != null);
+}
+
+test "client verb: insert-vec rejects multiple vector sources" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [256]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+
+    const lit_buf = try testing.allocator.dupe(u8, "1.0,0,0,0");
+    defer testing.allocator.free(lit_buf);
+    const args: cli.Args = .{
+        .subcommand = .client,
+        .client_verb = .insert_vec,
+        .client_dim = 4,
+        .client_literal = lit_buf[0..9],
+        .client_from_stdin = true, // also set — should error
+    };
+    try testing.expectError(error.ClientVerbFailed, runClientVerb(testing.allocator, &client, &args, .insert_vec, &w));
+    try testing.expect(std.mem.indexOf(u8, buf[0..w.end], "mutually exclusive") != null);
+}
+
+test "client verb: get returns name and vec" {
+    var ctx: ClientTestCtx = undefined;
+    try ctx.setUp(testing.allocator, 4, 8);
+    defer ctx.tearDown();
+    try ctx.start();
+
+    var client = try connectClient(testing.allocator, ctx.port);
+    defer client.deinit();
+
+    var buf: [512]u8 = undefined;
+
+    // First insert something
+    const lit_buf = try testing.allocator.dupe(u8, "1.0,0,0,0");
+    defer testing.allocator.free(lit_buf);
+    const insert_args: cli.Args = .{
+        .subcommand = .client,
+        .client_verb = .insert_vec,
+        .client_dim = 4,
+        .client_literal = lit_buf,
+    };
+    var w1 = std.io.Writer.fixed(&buf);
+    try runClientVerb(testing.allocator, &client, &insert_args, .insert_vec, &w1);
+
+    const pos0_buf = try testing.allocator.dupe(u8, "0");
+    defer testing.allocator.free(pos0_buf);
+    const get_args: cli.Args = .{
+        .subcommand = .client,
+        .client_verb = .get,
+        .client_pos0 = pos0_buf,
+        .client_dim = 4,
+        .client_full_vec = true,
+    };
+    var w2 = std.io.Writer.fixed(&buf);
+    try runClientVerb(testing.allocator, &client, &get_args, .get, &w2);
+    const out = buf[0..w2.end];
+    try testing.expect(std.mem.indexOf(u8, out, "name=") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "1") != null); // the vec contains 1.0
 }
