@@ -1,134 +1,29 @@
 const std = @import("std");
 const hnswz = @import("hnswz");
+const cli = @import("cli.zig");
 
 // Comptime tuning knob. Changing M requires a recompile. Everything else
 // (dim, ef_*, max_vectors, model, URL, …) comes from config.json.
 const M: usize = 16;
-const DEFAULT_TOP_K: usize = 5;
 
 const log = std.log.scoped(.main);
-
-const Subcommand = enum { build, query };
-
-const CliArgs = struct {
-    subcommand: Subcommand,
-    config_path: []u8,
-    source_dir: ?[]u8 = null, // build only
-    top_k: usize = DEFAULT_TOP_K, // query only
-};
-
-fn parseCli(allocator: std.mem.Allocator) !CliArgs {
-    var args = std.process.args();
-    _ = args.next();
-
-    var subcommand: ?Subcommand = null;
-    var config_path: ?[]u8 = null;
-    var source_dir: ?[]u8 = null;
-    var top_k: usize = DEFAULT_TOP_K;
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            try printUsage();
-            std.process.exit(0);
-        } else if (std.mem.eql(u8, arg, "--config")) {
-            const p = args.next() orelse return error.MissingValue;
-            config_path = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--config=")) {
-            config_path = try allocator.dupe(u8, arg["--config=".len..]);
-        } else if (std.mem.eql(u8, arg, "--source")) {
-            const p = args.next() orelse return error.MissingValue;
-            source_dir = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--source=")) {
-            source_dir = try allocator.dupe(u8, arg["--source=".len..]);
-        } else if (std.mem.eql(u8, arg, "-k") or std.mem.eql(u8, arg, "--top-k")) {
-            const p = args.next() orelse return error.MissingValue;
-            top_k = try std.fmt.parseInt(usize, p, 10);
-        } else if (std.mem.startsWith(u8, arg, "--top-k=")) {
-            top_k = try std.fmt.parseInt(usize, arg["--top-k=".len..], 10);
-        } else if (subcommand == null and !std.mem.startsWith(u8, arg, "-")) {
-            if (std.mem.eql(u8, arg, "build")) {
-                subcommand = .build;
-            } else if (std.mem.eql(u8, arg, "query")) {
-                subcommand = .query;
-            } else {
-                return error.UnknownSubcommand;
-            }
-        }
-    }
-
-    // Fall back to HNSWZ_CONFIG env var if --config not provided.
-    if (config_path == null) {
-        config_path = std.process.getEnvVarOwned(allocator, "HNSWZ_CONFIG") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => null,
-            else => return err,
-        };
-    }
-    if (config_path == null) return error.MissingConfig;
-    if (subcommand == null) return error.MissingSubcommand;
-    if (top_k == 0) return error.TopKZero;
-
-    return .{
-        .subcommand = subcommand.?,
-        .config_path = config_path.?,
-        .source_dir = source_dir,
-        .top_k = top_k,
-    };
-}
-
-fn printUsage() !void {
-    const usage =
-        \\Usage:
-        \\  hnswz build  --config <path> --source <dir>
-        \\  hnswz query  --config <path> [--top-k <n>]
-        \\
-        \\Subcommands:
-        \\  build  Ingest every .txt file in <dir>, embed via Ollama, build the
-        \\         HNSW graph, and persist vectors/graph/metadata to
-        \\         config.storage.data_dir.
-        \\  query  Load a prebuilt index and enter a REPL reading queries from
-        \\         stdin (one per line). Ctrl-D or :q exits.
-        \\
-        \\Options:
-        \\  --config <path>  Path to JSON config (or set HNSWZ_CONFIG env var).
-        \\  --source <dir>   (build only) Directory of .txt files to ingest.
-        \\  --top-k <n>      (query only) Number of results per query. Default 5.
-        \\
-    ;
-    var buf: [4096]u8 = undefined;
-    var stdout_file = std.fs.File.stdout().writer(&buf);
-    const w = &stdout_file.interface;
-    try w.writeAll(usage);
-    try w.flush();
-}
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cli = parseCli(allocator) catch |err| {
-        switch (err) {
-            error.MissingConfig => log.err("no config specified (use --config <path> or HNSWZ_CONFIG)", .{}),
-            error.MissingSubcommand => log.err("missing subcommand (build | query)", .{}),
-            error.MissingValue => log.err("flag requires a value", .{}),
-            error.UnknownSubcommand => log.err("unknown subcommand", .{}),
-            error.TopKZero => log.err("--top-k must be > 0", .{}),
-            else => log.err("CLI parse failed: {s}", .{@errorName(err)}),
-        }
-        try printUsage();
-        std.process.exit(2);
-    };
-    defer allocator.free(cli.config_path);
-    defer if (cli.source_dir) |s| allocator.free(s);
+    var args = cli.parseOrExit(allocator);
+    defer args.deinit(allocator);
 
-    var loaded = hnswz.config.loadFromPath(allocator, cli.config_path) catch |err| {
+    var loaded = hnswz.config.loadFromPath(allocator, args.config_path) catch |err| {
         switch (err) {
-            error.FileOpenFailed => log.err("cannot open config file: {s}", .{cli.config_path}),
-            error.FileReadFailed => log.err("cannot read config file: {s}", .{cli.config_path}),
-            error.ParseFailed => log.err("config JSON parse failed: {s}", .{cli.config_path}),
+            error.FileOpenFailed => log.err("cannot open config file: {s}", .{args.config_path}),
+            error.FileReadFailed => log.err("cannot read config file: {s}", .{args.config_path}),
+            error.ParseFailed => log.err("config JSON parse failed: {s}", .{args.config_path}),
             else => log.err("config load/validation failed: {s}", .{@errorName(err)}),
         }
-        std.process.exit(2);
+        std.process.exit(cli.USAGE_EXIT_CODE);
     };
     defer loaded.deinit();
     const cfg = &loaded.config;
@@ -137,15 +32,15 @@ pub fn main() !void {
         cfg.embedder.model, cfg.embedder.dim, cfg.storage.max_vectors,
     });
 
-    switch (cli.subcommand) {
+    switch (args.subcommand) {
         .build => {
-            const src = cli.source_dir orelse {
+            const src = args.source_dir orelse {
                 log.err("build requires --source <dir>", .{});
-                std.process.exit(2);
+                std.process.exit(cli.USAGE_EXIT_CODE);
             };
             try runBuild(allocator, cfg, src);
         },
-        .query => try runQuery(allocator, cfg, cli.top_k),
+        .query => try runQuery(allocator, cfg, args.top_k),
     }
 }
 
@@ -254,7 +149,7 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, sourc
 fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k: usize) !void {
     if (top_k > cfg.index.ef_search) {
         log.err("--top-k ({d}) must be <= config.index.ef_search ({d})", .{ top_k, cfg.index.ef_search });
-        std.process.exit(2);
+        std.process.exit(cli.USAGE_EXIT_CODE);
     }
 
     var data_dir = std.fs.cwd().openDir(cfg.storage.data_dir, .{}) catch |err| {
@@ -395,4 +290,11 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
         }
         try out.flush();
     }
+}
+
+// ── tests ──────────────────────────────────────────────────────────────
+
+test {
+    // Ensure cli.zig's tests get compiled when running the exe test binary.
+    _ = @import("cli.zig");
 }
