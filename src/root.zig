@@ -14,6 +14,7 @@ pub const distance = @import("distance.zig");
 pub const heap = @import("heap.zig");
 pub const config = @import("config.zig");
 pub const metadata = @import("metadata.zig");
+pub const benchmark = @import("benchmark.zig");
 
 test {
     _ = @import("distance.zig");
@@ -24,4 +25,5 @@ test {
     _ = @import("ollama.zig");
     _ = @import("config.zig");
     _ = @import("metadata.zig");
+    _ = @import("benchmark.zig");
 }
