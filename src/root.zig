@@ -13,6 +13,7 @@ pub const bruteforce = @import("bruteforce.zig");
 pub const distance = @import("distance.zig");
 pub const heap = @import("heap.zig");
 pub const config = @import("config.zig");
+pub const metadata = @import("metadata.zig");
 
 test {
     _ = @import("distance.zig");
@@ -22,4 +23,5 @@ test {
     _ = @import("hnsw.zig");
     _ = @import("ollama.zig");
     _ = @import("config.zig");
+    _ = @import("metadata.zig");
 }
