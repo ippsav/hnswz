@@ -16,31 +16,70 @@ pub fn main() !void {
     var args = cli.parseOrExit(allocator);
     defer args.deinit(allocator);
 
-    var loaded = hnswz.config.loadFromPath(allocator, args.config_path) catch |err| {
-        switch (err) {
-            error.FileOpenFailed => log.err("cannot open config file: {s}", .{args.config_path}),
-            error.FileReadFailed => log.err("cannot read config file: {s}", .{args.config_path}),
-            error.ParseFailed => log.err("config JSON parse failed: {s}", .{args.config_path}),
-            else => log.err("config load/validation failed: {s}", .{@errorName(err)}),
-        }
-        std.process.exit(cli.USAGE_EXIT_CODE);
-    };
-    defer loaded.deinit();
-    const cfg = &loaded.config;
-
-    log.info("config loaded: model={s} dim={d} max_vectors={d}", .{
-        cfg.embedder.model, cfg.embedder.dim, cfg.storage.max_vectors,
-    });
-
     switch (args.subcommand) {
-        .build => {
-            const src = args.source_dir orelse {
-                log.err("build requires --source <dir>", .{});
+        .build, .query => {
+            const path = args.config_path orelse {
+                log.err("{s} requires --config <path> (or set {s})", .{
+                    @tagName(args.subcommand), cli.CONFIG_ENV_VAR,
+                });
                 std.process.exit(cli.USAGE_EXIT_CODE);
             };
-            try runBuild(allocator, cfg, src);
+
+            var loaded = hnswz.config.loadFromPath(allocator, path) catch |err| {
+                switch (err) {
+                    error.FileOpenFailed => log.err("cannot open config file: {s}", .{path}),
+                    error.FileReadFailed => log.err("cannot read config file: {s}", .{path}),
+                    error.ParseFailed => log.err("config JSON parse failed: {s}", .{path}),
+                    else => log.err("config load/validation failed: {s}", .{@errorName(err)}),
+                }
+                std.process.exit(cli.USAGE_EXIT_CODE);
+            };
+            defer loaded.deinit();
+            const cfg = &loaded.config;
+
+            log.info("config loaded: model={s} dim={d} max_vectors={d}", .{
+                cfg.embedder.model, cfg.embedder.dim, cfg.storage.max_vectors,
+            });
+
+            switch (args.subcommand) {
+                .build => {
+                    const src = args.source_dir orelse {
+                        log.err("build requires --source <dir>", .{});
+                        std.process.exit(cli.USAGE_EXIT_CODE);
+                    };
+                    try runBuild(allocator, cfg, src);
+                },
+                .query => {
+                    const top_k = args.top_k orelse cli.DEFAULT_TOP_K;
+                    try runQuery(allocator, cfg, top_k);
+                },
+                .benchmark => unreachable,
+            }
         },
-        .query => try runQuery(allocator, cfg, args.top_k),
+        .benchmark => {
+            // Config is optional for benchmark. Load only if --config or the
+            // HNSWZ_CONFIG env var supplied a path; otherwise fall back to
+            // benchmark defaults.
+            var cfg_loaded: ?hnswz.config.Loaded = null;
+            defer if (cfg_loaded) |*l| l.deinit();
+
+            if (args.config_path) |path| {
+                cfg_loaded = hnswz.config.loadFromPath(allocator, path) catch |err| {
+                    switch (err) {
+                        error.FileOpenFailed => log.err("cannot open config file: {s}", .{path}),
+                        error.FileReadFailed => log.err("cannot read config file: {s}", .{path}),
+                        error.ParseFailed => log.err("config JSON parse failed: {s}", .{path}),
+                        else => log.err("config load/validation failed: {s}", .{@errorName(err)}),
+                    }
+                    std.process.exit(cli.USAGE_EXIT_CODE);
+                };
+                log.info("config loaded (benchmark defaults derive from it)", .{});
+            }
+
+            const cfg_opt: ?*const hnswz.config.Config =
+                if (cfg_loaded) |*l| &l.config else null;
+            try runBenchmark(allocator, cfg_opt, &args);
+        },
     }
 }
 
@@ -290,6 +329,106 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
         }
         try out.flush();
     }
+}
+
+// ── benchmark ─────────────────────────────────────────────────────────
+
+/// Hardcoded benchmark defaults. These apply when neither CLI flag nor
+/// config sets the value. Chosen so `zig build benchmark` with zero args
+/// finishes in a few seconds on a laptop while still producing a
+/// reasonable recall signal.
+const BENCH_DEFAULTS = struct {
+    const num_vectors: usize = 10_000;
+    const num_queries: usize = 1_000;
+    const dim: usize = 128;
+    const ef_construction: usize = 200;
+    const ef_search: usize = 100;
+    const seed: u64 = 42;
+    const warmup: usize = 50;
+};
+
+fn runBenchmark(
+    allocator: std.mem.Allocator,
+    cfg_opt: ?*const hnswz.config.Config,
+    args: *const cli.Args,
+) !void {
+    // Resolve each knob: CLI > config > hardcoded default.
+    const dim: usize = blk: {
+        if (args.bench_dim) |v| break :blk v;
+        if (cfg_opt) |c| break :blk c.embedder.dim;
+        break :blk BENCH_DEFAULTS.dim;
+    };
+    const ef_construction: usize = blk: {
+        if (args.bench_ef_construction) |v| break :blk v;
+        if (cfg_opt) |c| break :blk c.index.ef_construction;
+        break :blk BENCH_DEFAULTS.ef_construction;
+    };
+    const ef_search: usize = blk: {
+        if (args.bench_ef_search) |v| break :blk v;
+        if (cfg_opt) |c| break :blk c.index.ef_search;
+        break :blk BENCH_DEFAULTS.ef_search;
+    };
+    const seed: u64 = blk: {
+        if (args.bench_seed) |v| break :blk v;
+        if (cfg_opt) |c| break :blk c.index.seed;
+        break :blk BENCH_DEFAULTS.seed;
+    };
+    const top_k: usize = args.top_k orelse cli.DEFAULT_BENCH_TOP_K;
+    const num_vectors: usize = args.bench_num_vectors orelse BENCH_DEFAULTS.num_vectors;
+    const num_queries: usize = args.bench_num_queries orelse BENCH_DEFAULTS.num_queries;
+    const warmup: usize = args.bench_warmup orelse BENCH_DEFAULTS.warmup;
+
+    // Semantic validation — caught here so CLI users get a clean message
+    // instead of a panicking assert inside the benchmark loop.
+    if (num_vectors == 0) {
+        log.err("--num-vectors must be > 0", .{});
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    }
+    if (num_queries == 0) {
+        log.err("--num-queries must be > 0", .{});
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    }
+    if (dim == 0) {
+        log.err("--dim must be > 0", .{});
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    }
+    if (ef_construction == 0 or ef_search == 0) {
+        log.err("--ef-construction and --ef-search must be > 0", .{});
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    }
+    if (top_k > ef_search) {
+        log.err("--top-k ({d}) must be <= --ef-search ({d})", .{ top_k, ef_search });
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    }
+    if (num_vectors < top_k) {
+        log.err("--num-vectors ({d}) must be >= --top-k ({d})", .{ num_vectors, top_k });
+        std.process.exit(cli.USAGE_EXIT_CODE);
+    }
+
+    const max_ef = @max(ef_construction, ef_search);
+
+    const opts: hnswz.benchmark.Options = .{
+        .num_vectors = num_vectors,
+        .num_queries = num_queries,
+        .dim = dim,
+        .ef_construction = ef_construction,
+        .ef_search = ef_search,
+        .max_ef = max_ef,
+        .top_k = top_k,
+        .seed = seed,
+        .warmup = warmup,
+        .validate = args.bench_validate,
+        .json = args.bench_json,
+        // Generous default that matches the per-node slot budget used in
+        // the hnsw tests. Expected mean is num_vectors / (M-1).
+        .upper_pool_slots = num_vectors,
+    };
+
+    var out_buf: [8192]u8 = undefined;
+    var stdout_file_writer = std.fs.File.stdout().writer(&out_buf);
+    const out = &stdout_file_writer.interface;
+
+    try hnswz.benchmark.run(allocator, opts, out);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────

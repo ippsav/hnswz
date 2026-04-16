@@ -142,6 +142,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // `zig build benchmark` — run the installed binary with the `benchmark`
+    // subcommand so running perf regressions is a single command. Extra
+    // flags pass through: `zig build benchmark -- --num-vectors 50000 --json`.
+    const bench_cmd = b.addRunArtifact(exe);
+    bench_cmd.step.dependOn(b.getInstallStep());
+    bench_cmd.addArg("benchmark");
+    if (b.args) |extra| bench_cmd.addArgs(extra);
+    const bench_step = b.step("benchmark", "Run the HNSW benchmark suite");
+    bench_step.dependOn(&bench_cmd.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
