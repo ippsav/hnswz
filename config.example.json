@@ -1,0 +1,26 @@
+{
+  "embedder": {
+    "provider": "ollama",
+    "base_url": "http://localhost:11434",
+    "model": "qwen3-embedding",
+    "dim": 4096,
+    "normalize": false,
+    "request_timeout_ms": 30000,
+    "max_text_bytes": 131072
+  },
+  "index": {
+    "ef_construction": 200,
+    "ef_search": 100,
+    "max_ef": 200,
+    "seed": 42,
+    "distance": "cosine"
+  },
+  "storage": {
+    "data_dir": "./data",
+    "max_vectors": 10000,
+    "upper_pool_slots": 1000,
+    "vectors_file": "vectors.hvsf",
+    "graph_file": "graph.hgrf"
+  },
+  "log_level": "info"
+}
