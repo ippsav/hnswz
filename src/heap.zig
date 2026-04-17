@@ -98,7 +98,7 @@ pub const MinHeap = FixedHeap(true);
 /// Max-heap: pop returns the largest distance. Used as the results set.
 pub const MaxHeap = FixedHeap(false);
 
-// ── tests ──────────────────────────────────────────────────────────────
+
 
 const testing = std.testing;
 

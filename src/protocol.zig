@@ -40,8 +40,6 @@ pub const MAX_FRAME_BYTES_DEFAULT: u32 = 64 << 20;
 /// Minimum valid `body_len` — just the opcode/status byte + req_id, no payload.
 pub const MIN_BODY_LEN: u32 = 5;
 
-// ── enums ──────────────────────────────────────────────────────────────
-
 /// Non-exhaustive so an unknown byte does not crash the decoder — the
 /// dispatcher maps the `_` case to Status.unsupported_opcode.
 pub const Opcode = enum(u8) {
@@ -96,8 +94,6 @@ pub fn statusMessage(s: Status) []const u8 {
     };
 }
 
-// ── header encode/decode ───────────────────────────────────────────────
-
 pub const Header = struct {
     body_len: u32,
     /// Opcode byte on requests, status byte on responses. Caller decides.
@@ -139,8 +135,6 @@ pub fn totalFrameSize(h: Header) usize {
     return @as(usize, h.body_len) + 4;
 }
 
-// ── primitive encoders/decoders ────────────────────────────────────────
-
 inline fn readU16LE(bytes: []const u8) u16 {
     return std.mem.readInt(u16, bytes[0..2], .little);
 }
@@ -173,8 +167,6 @@ inline fn writeF32LE(dst: []u8, v: f32) void {
     std.mem.writeInt(u32, dst[0..4], @bitCast(v), .little);
 }
 
-// ── shared payload helpers ─────────────────────────────────────────────
-
 pub const DecodeError = error{ Truncated, DimMismatch, TextTooLong };
 
 /// Write an error response payload: `u16 msg_len | utf8 message`.
@@ -193,11 +185,6 @@ pub fn decodeErrorPayload(payload: []const u8) DecodeError![]const u8 {
     if (payload.len < 2 + @as(usize, n)) return error.Truncated;
     return payload[2..][0..n];
 }
-
-// ── PING (0x00) ────────────────────────────────────────────────────────
-// No request or response payload.
-
-// ── STATS (0x01) ───────────────────────────────────────────────────────
 
 pub const StatsResponse = struct {
     proto_version: u16,
@@ -245,8 +232,6 @@ pub fn decodeStatsResponse(payload: []const u8) DecodeError!StatsResponse {
     };
 }
 
-// ── INSERT_VEC (0x10) ──────────────────────────────────────────────────
-
 pub const InsertVecRequestView = struct {
     flags: u16,
     vec_bytes: []const u8, // length == dim * 4
@@ -283,8 +268,6 @@ pub fn decodeIdResponse(payload: []const u8) DecodeError!u32 {
     return readU32LE(payload[0..4]);
 }
 
-// ── INSERT_TEXT (0x11) ─────────────────────────────────────────────────
-
 pub const InsertTextRequestView = struct {
     flags: u16,
     text: []const u8,
@@ -307,8 +290,6 @@ pub fn decodeInsertTextRequest(payload: []const u8) DecodeError!InsertTextReques
     return .{ .flags = flags, .text = payload[4..][0..text_len] };
 }
 
-// ── DELETE (0x12) ──────────────────────────────────────────────────────
-
 pub fn encodeIdRequest(dst: []u8, id: u32) usize {
     std.debug.assert(dst.len >= 4);
     writeU32LE(dst[0..4], id);
@@ -319,8 +300,6 @@ pub fn decodeIdRequest(payload: []const u8) DecodeError!u32 {
     if (payload.len < 4) return error.Truncated;
     return readU32LE(payload[0..4]);
 }
-
-// ── REPLACE_VEC (0x13) ─────────────────────────────────────────────────
 
 pub const ReplaceVecRequestView = struct {
     id: u32,
@@ -344,8 +323,6 @@ pub fn decodeReplaceVecRequest(payload: []const u8, expected_dim: usize) DecodeE
     if (vec_bytes.len != expected_dim * 4) return error.DimMismatch;
     return .{ .id = id, .flags = flags, .vec_bytes = vec_bytes };
 }
-
-// ── REPLACE_TEXT (0x14) ────────────────────────────────────────────────
 
 pub const ReplaceTextRequestView = struct {
     id: u32,
@@ -372,8 +349,6 @@ pub fn decodeReplaceTextRequest(payload: []const u8) DecodeError!ReplaceTextRequ
     return .{ .id = id, .flags = flags, .text = payload[8..][0..text_len] };
 }
 
-// ── GET (0x20) ─────────────────────────────────────────────────────────
-
 pub const GetResponseView = struct {
     name: []const u8,
     vec_bytes: []const u8,
@@ -398,8 +373,6 @@ pub fn decodeGetResponse(payload: []const u8, expected_dim: usize) DecodeError!G
         .vec_bytes = payload[vec_start..][0 .. expected_dim * 4],
     };
 }
-
-// ── SEARCH_VEC (0x30) ──────────────────────────────────────────────────
 
 pub const SearchVecRequestView = struct {
     top_k: u16,
@@ -432,8 +405,6 @@ pub fn decodeSearchVecRequest(payload: []const u8, expected_dim: usize) DecodeEr
     if (vec_bytes.len != expected_dim * 4) return error.DimMismatch;
     return .{ .top_k = top_k, .ef = ef, .flags = flags, .vec_bytes = vec_bytes };
 }
-
-// ── SEARCH_TEXT (0x31) ─────────────────────────────────────────────────
 
 pub const SearchTextRequestView = struct {
     top_k: u16,
@@ -536,8 +507,6 @@ pub fn searchResultIter(payload: []const u8) DecodeError!SearchResultIter {
     return .{ .payload = payload, .cursor = 2, .remaining = n };
 }
 
-// ── SNAPSHOT (0x40) ────────────────────────────────────────────────────
-
 pub fn encodeSnapshotResponse(dst: []u8, elapsed_ns: u64) usize {
     std.debug.assert(dst.len >= 8);
     writeU64LE(dst[0..8], elapsed_ns);
@@ -548,11 +517,6 @@ pub fn decodeSnapshotResponse(payload: []const u8) DecodeError!u64 {
     if (payload.len < 8) return error.Truncated;
     return readU64LE(payload[0..8]);
 }
-
-// ── CLOSE (0xFF) ───────────────────────────────────────────────────────
-// No payload either direction.
-
-// ── tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 

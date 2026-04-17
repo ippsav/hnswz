@@ -16,8 +16,6 @@ pub const Embedder = struct {
     }
 };
 
-// ── OllamaClient ──────────────────────────────────────────────────────
-
 /// Ollama embedding client. All scratch buffers are preallocated at init.
 /// Single-threaded — not safe for concurrent use.
 pub const OllamaClient = struct {
@@ -158,8 +156,6 @@ pub fn verifyNormalization(vec: []const f32) !void {
     }
 }
 
-// ── FakeEmbedder (for tests) ──────────────────────────────────────────
-
 pub const FakeEmbedder = struct {
     dim: usize,
     seed: u64,
@@ -202,7 +198,7 @@ pub const FakeEmbedder = struct {
     }
 };
 
-// ── tests ──────────────────────────────────────────────────────────────
+
 
 const testing = std.testing;
 

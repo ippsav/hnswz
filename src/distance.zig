@@ -6,7 +6,8 @@ const assert = std.debug.assert;
 //
 // res = (1 * 4) + (2 * 5) + (3 * 6) = 32
 
-const Vec4 = @Vector(4, f32);
+const VecLen = 4;
+const Vec4 = @Vector(VecLen, f32);
 
 pub fn dot(a: []const f32, b: []const f32) f32 {
     assert(a.len == b.len);
@@ -16,9 +17,9 @@ pub fn dot(a: []const f32, b: []const f32) f32 {
     var sum: f32 = 0;
     var i: usize = 0;
 
-    while (i + 4 <= a.len) : (i += 4) {
-        const va: Vec4 = a[i..][0..4].*;
-        const vb: Vec4 = b[i..][0..4].*;
+    while (i + VecLen <= a.len) : (i += VecLen) {
+        const va: Vec4 = a[i..][0..VecLen].*;
+        const vb: Vec4 = b[i..][0..VecLen].*;
 
         acc += va * vb;
     }

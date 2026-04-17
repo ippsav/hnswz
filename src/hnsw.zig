@@ -168,8 +168,6 @@ pub fn HnswIndex(comptime M: usize) type {
             }
         }
 
-        // ── accessor helpers ────────────────────────────────────────────
-
         const LayerView = struct {
             neighbors: []u32, // full slice of size M0 (layer 0) or M (upper)
             len: *u16,
@@ -215,8 +213,6 @@ pub fn HnswIndex(comptime M: usize) type {
             lv.len.* = 0;
         }
 
-        // ── distance shims ──────────────────────────────────────────────
-
         fn distanceTo(self: *const Self, a: u32, b: []const f32) f32 {
             return distance.cosineNormalized(self.store.get(a), b);
         }
@@ -224,8 +220,6 @@ pub fn HnswIndex(comptime M: usize) type {
         fn distanceBetween(self: *const Self, a: u32, b: u32) f32 {
             return distance.cosineNormalized(self.store.get(a), self.store.get(b));
         }
-
-        // ── search primitives ───────────────────────────────────────────
 
         pub fn randomLevel(self: *Self) u8 {
             const random = self.rng.random();
@@ -448,8 +442,6 @@ pub fn HnswIndex(comptime M: usize) type {
             self.max_level = best_level;
         }
 
-        // ── insert, delete, search (public) ─────────────────────────────
-
         pub fn insert(self: *Self, ws: *Workspace, id: u32) !void {
             if (@as(usize, id) >= self.max_vectors) return error.IndexFull;
 
@@ -601,8 +593,6 @@ pub fn HnswIndex(comptime M: usize) type {
             @memcpy(out[0..actual_k], results[0..actual_k]);
             return out[0..actual_k];
         }
-
-        // ── persistence ─────────────────────────────────────────────────
 
         /// Format: "HGRF" | version u32 | M u32 | entry_point u32 | max_level u8
         ///         | ef_construction u32 | node_count u32
@@ -785,7 +775,7 @@ pub fn HnswIndex(comptime M: usize) type {
     };
 }
 
-// ── tests ──────────────────────────────────────────────────────────────
+
 
 const testing = std.testing;
 

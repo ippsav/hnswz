@@ -134,7 +134,7 @@ fn validate(c: Config) ValidationError!void {
     if (!std.mem.eql(u8, c.embedder.provider, "ollama")) return error.UnsupportedProvider;
 }
 
-// ── tests ──────────────────────────────────────────────────────────────
+
 
 const testing = std.testing;
 
