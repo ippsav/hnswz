@@ -20,7 +20,11 @@
     "max_vectors": 10000,
     "upper_pool_slots": 1000,
     "vectors_file": "vectors.hvsf",
-    "graph_file": "graph.hgrf"
+    "graph_file": "graph.hgrf",
+    "metadata_file": "metadata.hmtf",
+    "wal_file": "wal.hwal",
+    "lock_file": "hnswz.lock",
+    "wal_enabled": true
   },
   "log_level": "info"
 }
