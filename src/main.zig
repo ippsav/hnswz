@@ -720,6 +720,7 @@ fn runBenchmark(
             // small buffer.
             (args.bench_concurrent_clients orelse 1) + 8,
         )),
+        .dataset_dir = args.bench_dataset,
     };
 
     var out_buf: [8192]u8 = undefined;

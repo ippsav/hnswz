@@ -75,6 +75,11 @@ pub const Args = struct {
     /// 1-vector SEARCH_VEC RTT). Skips the build+search workload entirely.
     /// Implies `--transport tcp`.
     bench_protocol: bool = false,
+    /// Directory holding SIFT-style `*base.fvecs` / `*query.fvecs` /
+    /// optional `*groundtruth.ivecs`. When set, the benchmark replaces
+    /// the seeded PRNG with vectors loaded from this directory and
+    /// infers `dim` from the file.
+    bench_dataset: ?[]u8 = null,
 
     // serve-only knobs. All optional; main.zig falls back to ServeOptions defaults.
     serve_listen: ?[]u8 = null, // "host:port"
@@ -109,6 +114,7 @@ pub const Args = struct {
         if (self.client_pos1) |p| allocator.free(p);
         if (self.client_from_file) |p| allocator.free(p);
         if (self.client_literal) |p| allocator.free(p);
+        if (self.bench_dataset) |p| allocator.free(p);
         self.* = undefined;
     }
 };
@@ -165,6 +171,7 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
     var bench_protocol = false;
     var bench_concurrent_clients: ?usize = null;
     var bench_server_workers: ?usize = null;
+    var bench_dataset: ?[]u8 = null;
 
     var serve_listen: ?[]u8 = null;
     var serve_auto_snapshot_secs: ?u32 = null;
@@ -194,6 +201,7 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
         if (client_pos1) |p| allocator.free(p);
         if (client_from_file) |p| allocator.free(p);
         if (client_literal) |p| allocator.free(p);
+        if (bench_dataset) |p| allocator.free(p);
     }
 
     while (it.next()) |arg| {
@@ -286,6 +294,13 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
             bench_server_workers = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
         } else if (std.mem.startsWith(u8, arg, "--server-workers=")) {
             bench_server_workers = parseUsize(arg["--server-workers=".len..]) orelse return error.InvalidBenchmarkNumber;
+        } else if (std.mem.eql(u8, arg, "--dataset")) {
+            const p = it.next() orelse return error.MissingValue;
+            if (bench_dataset) |old| allocator.free(old);
+            bench_dataset = try allocator.dupe(u8, p);
+        } else if (std.mem.startsWith(u8, arg, "--dataset=")) {
+            if (bench_dataset) |old| allocator.free(old);
+            bench_dataset = try allocator.dupe(u8, arg["--dataset=".len..]);
         } else if (std.mem.eql(u8, arg, "--listen")) {
             const p = it.next() orelse return error.MissingValue;
             if (serve_listen) |old| allocator.free(old);
@@ -409,6 +424,7 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
         .bench_protocol = bench_protocol,
         .bench_concurrent_clients = bench_concurrent_clients,
         .bench_server_workers = bench_server_workers,
+        .bench_dataset = bench_dataset,
         .serve_listen = serve_listen,
         .serve_auto_snapshot_secs = serve_auto_snapshot_secs,
         .serve_max_connections = serve_max_connections,
@@ -505,6 +521,11 @@ pub fn printUsage() !void {
         \\  --bench-protocol       Skip the normal build+search workload;
         \\                         measure PING RTT and 1-vector SEARCH_VEC
         \\                         RTT only. Implies --transport tcp.
+        \\  --dataset <dir>        Load base/query/groundtruth from a
+        \\                         SIFT-style fvecs/ivecs directory. Sets
+        \\                         --dim from the file and uses the
+        \\                         shipped groundtruth for recall
+        \\                         (no brute-force pass).
         \\
         \\Serve options:
         \\  --listen <host:port>         Bind address. Default 127.0.0.1:9000.

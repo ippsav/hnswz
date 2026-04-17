@@ -5,3 +5,8 @@ zig-out/
 .DS_Store
 wiki_paragraphs/
 
+# Benchmark harness scratch — datasets (~500 MB), per-run result JSONs,
+# and the local hnswlib venv are all regenerable from bench/run.sh.
+bench/data/
+bench/results/
+bench/.venv/

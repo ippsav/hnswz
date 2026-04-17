@@ -15,6 +15,7 @@ pub const heap = @import("heap.zig");
 pub const config = @import("config.zig");
 pub const metadata = @import("metadata.zig");
 pub const benchmark = @import("benchmark.zig");
+pub const bench_dataset = @import("bench_dataset.zig");
 pub const protocol = @import("protocol.zig");
 pub const metadata_mut = @import("metadata_mut.zig");
 pub const server = @import("server.zig");
@@ -34,6 +35,7 @@ test {
     _ = @import("config.zig");
     _ = @import("metadata.zig");
     _ = @import("benchmark.zig");
+    _ = @import("bench_dataset.zig");
     _ = @import("protocol.zig");
     _ = @import("metadata_mut.zig");
     _ = @import("server.zig");

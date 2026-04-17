@@ -100,10 +100,57 @@ Flags:
 | `--warmup <n>` | `50` | untimed warmup queries |
 | `--validate` | off | compute recall@k against brute force |
 | `--json` | off | machine-readable output |
+| `--dataset <dir>` | off | load base/query/groundtruth from SIFT-style `.fvecs`/`.ivecs` (sets `--dim` from file; uses shipped groundtruth for recall) |
 | `--concurrent-clients <n>` | `1` | TCP search phase clients in parallel (driver threads) |
 | `--server-workers <n>` | `0` (auto) | TCP server worker-pool size |
 
 > Run release-mode for meaningful numbers: `zig build -Doptimize=ReleaseFast`.
+
+#### vs `hnswlib`
+
+A turnkey comparison harness lives under [bench/](bench/). It downloads
+SIFT1M / siftsmall, runs hnswz and [hnswlib](https://github.com/nmslib/hnswlib)
+on the same bytes with matched parameters (M=16, ef_construction=200,
+ef_search=100, top-k=10), and diffs the JSON reports.
+
+```sh
+bench/run.sh siftsmall   # smoke (~20 s wall on Apple Silicon, <10 MB download)
+bench/run.sh sift1m      # headline (~15 min wall, ~500 MB download)
+```
+
+**Single-threaded, Apple M-series, cosine distance, L2-normalized
+vectors (cosine and L2 induce identical NN ordering on unit vectors
+so SIFT's L2 groundtruth stays valid):**
+
+SIFT1M — 1M × 128d, 10k queries:
+
+| metric | hnswz | hnswlib | verdict |
+|---|---:|---:|---|
+| build wall | 358.6 s | 473.1 s | **hnswz 1.32× faster** |
+| build throughput (native API) | 2.8k/s | 2.1k/s | **hnswz 1.30× faster** |
+| search QPS | **4.6k/s** | 3.5k/s | **hnswz 1.33× faster** |
+| search p50 | 218 µs | 291 µs | hnswz 1.33× faster |
+| search p99 | 335 µs | 393 µs | hnswz 1.17× faster |
+| recall@10 | 0.9804 | 0.9772 | effectively tied |
+
+siftsmall — 10k × 128d, 100 queries:
+
+| metric | hnswz | hnswlib | verdict |
+|---|---:|---:|---|
+| build throughput | 13.8k/s | 7.6k/s | hnswz 1.81× faster |
+| search QPS | **26.0k/s** | 8.9k/s | hnswz 2.92× faster |
+| recall@10 | 0.9920 | 0.9920 | identical |
+
+Caveats:
+
+- Single-threaded on both sides (`threads=1` on hnswlib, `in-process`
+  on hnswz). Multi-threaded ingest is a different question — hnswlib
+  parallelizes `add_items` natively, hnswz's writer path serializes.
+- hnswlib's per-item latency percentiles include ~1–2 µs of Python
+  trampoline per call; the "build throughput (native API)" row uses
+  its batched `add_items(full)` call to neutralize that.
+- Run on your own hardware before drawing conclusions; these numbers
+  reflect one laptop, not a cloud fleet.
 
 ### `serve` — long-running TCP database
 

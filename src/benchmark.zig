@@ -22,6 +22,7 @@ const client_mod = @import("client.zig");
 const MutableMetadata = @import("metadata_mut.zig").MutableMetadata;
 const config_mod = @import("config.zig");
 const ollama = @import("ollama.zig");
+const bench_dataset = @import("bench_dataset.zig");
 
 /// Must match the M baked into the shipped binary (see main.zig).
 pub const M: usize = 16;
@@ -70,6 +71,12 @@ pub const Options = struct {
     /// For `.tcp`: size of the server's connection table. Must be >=
     /// `concurrent_clients` to avoid connection rejections. Default 64.
     tcp_max_connections: u16 = 64,
+    /// When set, base and query vectors are loaded from SIFT-style
+    /// `.fvecs` files in this directory (`*base.fvecs`, `*query.fvecs`,
+    /// optionally `*groundtruth.ivecs`). `dim` / `num_vectors` /
+    /// `num_queries` are then clamped to (and typically defaulted from)
+    /// the file contents; see `resolveDatasetCounts`.
+    dataset_dir: ?[]const u8 = null,
 };
 
 /// Fixed-capacity linear-bucket latency histogram.
@@ -202,7 +209,27 @@ pub fn run(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !vo
     return runInProcess(allocator, opts, out);
 }
 
-fn runInProcess(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !void {
+fn runInProcess(allocator: std.mem.Allocator, opts_in: Options, out: *std.io.Writer) !void {
+    var opts = opts_in;
+
+    // If a dataset was requested, load it first and clamp the effective
+    // counts / dim to whatever the files carry. Everything below this
+    // block works off the (possibly adjusted) `opts` so the random-mode
+    // and dataset-mode paths share code downstream.
+    var dataset: ?bench_dataset.Dataset = null;
+    defer if (dataset) |*d| d.deinit();
+    if (opts.dataset_dir) |dir| {
+        var d = try bench_dataset.load(allocator, dir);
+        if (opts.num_vectors > d.num_base or opts.num_queries > d.num_queries) {
+            // Clamp is a policy call that silently hides user mistakes;
+            // an explicit error is more useful.
+            d.deinit();
+            return error.DatasetTooSmall;
+        }
+        opts.dim = d.dim;
+        dataset = d;
+    }
+
     std.debug.assert(opts.num_vectors > 0);
     std.debug.assert(opts.num_queries > 0);
     std.debug.assert(opts.dim > 0);
@@ -231,7 +258,13 @@ fn runInProcess(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer
     const query_buf = try allocator.alloc(f32, opts.num_queries * opts.dim);
     defer allocator.free(query_buf);
 
-    {
+    if (dataset) |d| {
+        for (0..opts.num_vectors) |i| {
+            const src = d.base[i * opts.dim ..][0..opts.dim];
+            _ = try store.add(src);
+        }
+        @memcpy(query_buf, d.queries[0 .. opts.num_queries * opts.dim]);
+    } else {
         var prng = std.Random.DefaultPrng.init(opts.seed);
         const random = prng.random();
         const scratch = try allocator.alloc(f32, opts.dim);
@@ -255,15 +288,28 @@ fn runInProcess(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer
     if (opts.validate) {
         const truth = try allocator.alloc(u32, opts.num_queries * opts.top_k);
         truth_ids = truth;
-        for (0..opts.num_queries) |qi| {
-            const q = query_buf[qi * opts.dim ..][0..opts.dim];
-            const bf = try bruteforce.search(&store, q, opts.top_k, allocator);
-            defer allocator.free(bf);
-            const got = @min(opts.top_k, bf.len);
-            for (0..got) |i| truth[qi * opts.top_k + i] = bf[i].id;
-            // Shouldn't happen (num_vectors >= top_k asserted above), but
-            // pad with a sentinel so recall computations stay well-defined.
-            for (got..opts.top_k) |i| truth[qi * opts.top_k + i] = std.math.maxInt(u32);
+        if (dataset) |d| if (d.truth) |file_truth| {
+            // Use pre-computed groundtruth from the dataset file. Truth
+            // ids line up with insertion order (we inserted base[0..n]
+            // in sequence, and SIFT groundtruth is indexed off the base).
+            std.debug.assert(d.truth_k >= opts.top_k);
+            for (0..opts.num_queries) |qi| {
+                const src = file_truth[qi * d.truth_k ..][0..opts.top_k];
+                const dst = truth[qi * opts.top_k ..][0..opts.top_k];
+                @memcpy(dst, src);
+            }
+        };
+        if (dataset == null or dataset.?.truth == null) {
+            for (0..opts.num_queries) |qi| {
+                const q = query_buf[qi * opts.dim ..][0..opts.dim];
+                const bf = try bruteforce.search(&store, q, opts.top_k, allocator);
+                defer allocator.free(bf);
+                const got = @min(opts.top_k, bf.len);
+                for (0..got) |i| truth[qi * opts.top_k + i] = bf[i].id;
+                // Shouldn't happen (num_vectors >= top_k asserted above), but
+                // pad with a sentinel so recall computations stay well-defined.
+                for (got..opts.top_k) |i| truth[qi * opts.top_k + i] = std.math.maxInt(u32);
+            }
         }
     }
 
@@ -392,8 +438,10 @@ fn writePhase(w: *std.io.Writer, s: PhaseStats, unit: []const u8) !void {
 fn writeJson(w: *std.io.Writer, r: Report) !void {
     try w.print(
         \\{{
-        \\  "schema_version": 1,
+        \\  "schema_version": 2,
+        \\  "library": "hnswz",
         \\  "build_mode": "{s}",
+        \\  "distance": "cosine",
         \\  "params": {{
         \\    "seed": {d},
         \\    "dim": {d},
@@ -413,6 +461,11 @@ fn writeJson(w: *std.io.Writer, r: Report) !void {
         r.opts.ef_construction, r.opts.ef_search,
         r.opts.top_k, r.opts.warmup, r.opts.upper_pool_slots,
     });
+    if (r.opts.dataset_dir) |dir| {
+        try w.print("  \"dataset\": \"{s}\",\n", .{dir});
+    } else {
+        try w.writeAll("  \"dataset\": null,\n");
+    }
     try w.writeAll("  \"build\": ");
     try writePhaseJson(w, r.build);
     try w.print(",\n  \"upper_used\": {d},\n  \"search\": ", .{r.upper_used});
@@ -537,7 +590,21 @@ const TcpHarness = struct {
 
 const protocol_mod = @import("protocol.zig");
 
-fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !void {
+fn runTcp(allocator: std.mem.Allocator, opts_in: Options, out: *std.io.Writer) !void {
+    var opts = opts_in;
+
+    var dataset: ?bench_dataset.Dataset = null;
+    defer if (dataset) |*d| d.deinit();
+    if (opts.dataset_dir) |dir| {
+        var d = try bench_dataset.load(allocator, dir);
+        if (opts.num_vectors > d.num_base or opts.num_queries > d.num_queries) {
+            d.deinit();
+            return error.DatasetTooSmall;
+        }
+        opts.dim = d.dim;
+        dataset = d;
+    }
+
     std.debug.assert(opts.num_vectors > 0);
     std.debug.assert(opts.num_queries > 0);
     std.debug.assert(opts.dim > 0);
@@ -567,14 +634,18 @@ fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !voi
     });
     defer client.deinit();
 
-    // Deterministic vector / query generation — same algorithm, same
-    // seed as in_process.
+    // Deterministic vector / query source — dataset file if provided,
+    // otherwise the same seeded PRNG the in_process path uses so JSON
+    // diffs across transports stay meaningful.
     const query_buf = try allocator.alloc(f32, opts.num_queries * opts.dim);
     defer allocator.free(query_buf);
     const vec_buf = try allocator.alloc(f32, opts.num_vectors * opts.dim);
     defer allocator.free(vec_buf);
 
-    {
+    if (dataset) |d| {
+        @memcpy(vec_buf, d.base[0 .. opts.num_vectors * opts.dim]);
+        @memcpy(query_buf, d.queries[0 .. opts.num_queries * opts.dim]);
+    } else {
         var prng = std.Random.DefaultPrng.init(opts.seed);
         const random = prng.random();
         for (0..opts.num_vectors) |i| {
@@ -607,13 +678,23 @@ fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !voi
     if (opts.validate) {
         const truth = try allocator.alloc(u32, opts.num_queries * opts.top_k);
         truth_ids = truth;
-        for (0..opts.num_queries) |qi| {
-            const q = query_buf[qi * opts.dim ..][0..opts.dim];
-            const bf = try bruteforce.search(&h.store, q, opts.top_k, allocator);
-            defer allocator.free(bf);
-            const got = @min(opts.top_k, bf.len);
-            for (0..got) |i| truth[qi * opts.top_k + i] = bf[i].id;
-            for (got..opts.top_k) |i| truth[qi * opts.top_k + i] = std.math.maxInt(u32);
+        if (dataset) |d| if (d.truth) |file_truth| {
+            std.debug.assert(d.truth_k >= opts.top_k);
+            for (0..opts.num_queries) |qi| {
+                const src = file_truth[qi * d.truth_k ..][0..opts.top_k];
+                const dst = truth[qi * opts.top_k ..][0..opts.top_k];
+                @memcpy(dst, src);
+            }
+        };
+        if (dataset == null or dataset.?.truth == null) {
+            for (0..opts.num_queries) |qi| {
+                const q = query_buf[qi * opts.dim ..][0..opts.dim];
+                const bf = try bruteforce.search(&h.store, q, opts.top_k, allocator);
+                defer allocator.free(bf);
+                const got = @min(opts.top_k, bf.len);
+                for (0..got) |i| truth[qi * opts.top_k + i] = bf[i].id;
+                for (got..opts.top_k) |i| truth[qi * opts.top_k + i] = std.math.maxInt(u32);
+            }
         }
     }
 
@@ -909,7 +990,7 @@ test "run benchmark with tiny params produces JSON" {
     const out = buf[0..fixed.end];
     try testing.expect(out.len > 0);
     try testing.expectEqual(@as(u8, '{'), out[0]);
-    try testing.expect(std.mem.indexOf(u8, out, "\"schema_version\": 1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"schema_version\": 2") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"recall_at_k\":") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"build\":") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"search\":") != null);
