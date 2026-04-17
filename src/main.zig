@@ -89,8 +89,6 @@ pub fn main() !void {
     }
 }
 
-// ── build ─────────────────────────────────────────────────────────────
-
 fn strLessThan(_: void, a: []u8, b: []u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
@@ -188,8 +186,6 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, sourc
 
     log.info("index built: {d} vectors saved to {s}", .{ n, cfg.storage.data_dir });
 }
-
-// ── query ─────────────────────────────────────────────────────────────
 
 fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k: usize) !void {
     if (top_k > cfg.index.ef_search) {
@@ -337,8 +333,6 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
     }
 }
 
-// ── serve ─────────────────────────────────────────────────────────────
-
 /// Split "host:port" on the LAST colon so IPv6 literals (when supported
 /// in the future) don't get mis-parsed. Returns null on malformed input.
 fn splitHostPort(s: []const u8) ?struct { host: []const u8, port: u16 } {
@@ -437,8 +431,8 @@ fn runServe(
         } else |_| {}
     }
 
-    var ws = try Index.Workspace.init(allocator, cfg.storage.max_vectors, cfg.index.max_ef);
-    defer ws.deinit(allocator);
+    // Workspaces are owned by the dispatcher's worker pool now — no
+    // server-side Workspace allocation here.
 
     // Embedder: Ollama if configured. Text opcodes fail cleanly otherwise.
     var maybe_client: ?hnswz.OllamaClient = null;
@@ -462,13 +456,14 @@ fn runServe(
         .idle_timeout_secs = args.serve_idle_timeout_secs orelse 60,
         .auto_snapshot_secs = args.serve_auto_snapshot_secs orelse 0,
         .reuse_address = true,
+        .n_workers = args.serve_n_workers orelse 0,
     };
 
-    var server_inst = try Server.init(allocator, &store, &index, &mm, &ws, embedder, cfg, opts);
+    var server_inst = try Server.init(allocator, &store, &index, &mm, embedder, cfg, opts);
     defer server_inst.deinit();
 
     var shutdown_flag: std.atomic.Value(bool) = .init(false);
-    hnswz.server.installSignalHandlers(&shutdown_flag);
+    hnswz.server.installSignalHandlers(&shutdown_flag, server_inst.shutdown_w);
 
     log.info("serve: listening on {s}:{d} (loaded={d} vectors)", .{
         parts.host, server_inst.bound_port, store.live_count,
@@ -477,8 +472,6 @@ fn runServe(
     try server_inst.run(&shutdown_flag);
     log.info("serve: shut down cleanly", .{});
 }
-
-// ── benchmark ─────────────────────────────────────────────────────────
 
 /// Hardcoded benchmark defaults. These apply when neither CLI flag nor
 /// config sets the value. Chosen so `zig build benchmark` with zero args
@@ -576,6 +569,14 @@ fn runBenchmark(
         .upper_pool_slots = num_vectors,
         .transport = transport,
         .bench_protocol = args.bench_protocol,
+        .concurrent_clients = args.bench_concurrent_clients orelse 1,
+        .server_n_workers = args.bench_server_workers orelse 0,
+        .tcp_max_connections = @intCast(@min(
+            @as(usize, std.math.maxInt(u16)),
+            // Always have room for at least the concurrent clients + a
+            // small buffer.
+            (args.bench_concurrent_clients orelse 1) + 8,
+        )),
     };
 
     var out_buf: [8192]u8 = undefined;
@@ -584,8 +585,6 @@ fn runBenchmark(
 
     try hnswz.benchmark.run(allocator, opts, out);
 }
-
-// ── client ────────────────────────────────────────────────────────────
 
 fn runClient(allocator: std.mem.Allocator, args: *const cli.Args) !void {
     const verb = args.client_verb orelse {
@@ -726,8 +725,6 @@ fn runClientVerb(
     }
 }
 
-// ── client: helpers ───────────────────────────────────────────────────
-
 fn requireIdPos(maybe: ?[]u8, out: *std.io.Writer, json_mode: bool) !u32 {
     const s = maybe orelse return writeUsageError(out, json_mode, "verb requires an <id> positional argument");
     return std.fmt.parseInt(u32, s, 10) catch {
@@ -813,8 +810,6 @@ fn readVec(
     }
     return vec;
 }
-
-// ── client: output formatters ─────────────────────────────────────────
 
 fn writeUsageError(out: *std.io.Writer, json_mode: bool, msg: []const u8) error{ClientVerbFailed} {
     if (json_mode) {
@@ -962,15 +957,11 @@ fn writeJsonEscaped(out: *std.io.Writer, s: []const u8) !void {
     }
 }
 
-// ── tests ──────────────────────────────────────────────────────────────
-
 test {
     // Ensure cli.zig's tests get compiled when running the exe test binary.
     _ = @import("cli.zig");
 }
 
-// ── client-verb integration tests ─────────────────────────────────────
-//
 // Each test spins up a real `hnswz.server.Server` on an ephemeral port
 // with a `FakeEmbedder`, connects a `hnswz.client.Client`, and drives
 // the full `runClientVerb` path. Assertions run against a fixed-buffer
@@ -984,7 +975,6 @@ const ClientTestCtx = struct {
     store: hnswz.Store,
     index: hnswz.HnswIndex(M),
     md: hnswz.metadata_mut.MutableMetadata,
-    ws: hnswz.HnswIndex(M).Workspace,
     embedder: hnswz.FakeEmbedder,
     srv: hnswz.server.Server(M),
     shutdown: std.atomic.Value(bool),
@@ -1009,14 +999,12 @@ const ClientTestCtx = struct {
             .seed = self.cfg.index.seed,
         });
         self.md = hnswz.metadata_mut.MutableMetadata.init();
-        self.ws = try hnswz.HnswIndex(M).Workspace.init(allocator, max_vectors, self.cfg.index.max_ef);
         self.embedder = hnswz.FakeEmbedder.init(dim, 0xabcd);
         self.srv = try hnswz.server.Server(M).init(
             allocator,
             &self.store,
             &self.index,
             &self.md,
-            &self.ws,
             self.embedder.embedder(),
             &self.cfg,
             .{
@@ -1028,6 +1016,7 @@ const ClientTestCtx = struct {
                 .auto_snapshot_secs = 0,
                 .reuse_address = true,
                 .skip_final_snapshot = true,
+                .n_workers = 2,
             },
         );
         self.port = self.srv.bound_port;
@@ -1042,11 +1031,10 @@ const ClientTestCtx = struct {
     }
 
     fn tearDown(self: *ClientTestCtx) void {
-        self.shutdown.store(true, .monotonic);
+        self.srv.requestShutdown();
         if (self.thread) |t| t.join();
         self.thread = null;
         self.srv.deinit();
-        self.ws.deinit(self.allocator);
         self.md.deinit(self.allocator);
         self.index.deinit();
         self.store.deinit(self.allocator);

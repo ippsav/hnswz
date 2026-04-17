@@ -67,6 +67,10 @@ pub const Args = struct {
     bench_validate: bool = false,
     bench_json: bool = false,
     bench_transport: ?BenchTransport = null,
+    /// Concurrent client threads for the TCP search phase. Default 1.
+    bench_concurrent_clients: ?usize = null,
+    /// Server-side worker count for `--transport tcp`. Default 0 = auto.
+    bench_server_workers: ?usize = null,
     /// If true, run only the protocol-floor micro-benchmark (PING RTT +
     /// 1-vector SEARCH_VEC RTT). Skips the build+search workload entirely.
     /// Implies `--transport tcp`.
@@ -78,6 +82,8 @@ pub const Args = struct {
     serve_max_connections: ?u32 = null,
     serve_max_frame_bytes: ?usize = null,
     serve_idle_timeout_secs: ?u32 = null,
+    /// 0 (or unset) = auto; otherwise the size of the worker pool.
+    serve_n_workers: ?usize = null,
 
     // client-only knobs. `client_pos0` / `client_pos1` carry verb-specific
     // positional args (e.g. `delete <id>` has pos0="42"). Interpretation
@@ -157,12 +163,15 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
     var bench_json = false;
     var bench_transport: ?BenchTransport = null;
     var bench_protocol = false;
+    var bench_concurrent_clients: ?usize = null;
+    var bench_server_workers: ?usize = null;
 
     var serve_listen: ?[]u8 = null;
     var serve_auto_snapshot_secs: ?u32 = null;
     var serve_max_connections: ?u32 = null;
     var serve_max_frame_bytes: ?usize = null;
     var serve_idle_timeout_secs: ?u32 = null;
+    var serve_n_workers: ?usize = null;
 
     var client_verb: ?ClientVerb = null;
     var client_connect: ?[]u8 = null;
@@ -267,6 +276,16 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
             bench_transport = try parseBenchTransport(arg["--transport=".len..]);
         } else if (std.mem.eql(u8, arg, "--bench-protocol")) {
             bench_protocol = true;
+        } else if (std.mem.eql(u8, arg, "--concurrent-clients")) {
+            const p = it.next() orelse return error.MissingValue;
+            bench_concurrent_clients = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
+        } else if (std.mem.startsWith(u8, arg, "--concurrent-clients=")) {
+            bench_concurrent_clients = parseUsize(arg["--concurrent-clients=".len..]) orelse return error.InvalidBenchmarkNumber;
+        } else if (std.mem.eql(u8, arg, "--server-workers")) {
+            const p = it.next() orelse return error.MissingValue;
+            bench_server_workers = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
+        } else if (std.mem.startsWith(u8, arg, "--server-workers=")) {
+            bench_server_workers = parseUsize(arg["--server-workers=".len..]) orelse return error.InvalidBenchmarkNumber;
         } else if (std.mem.eql(u8, arg, "--listen")) {
             const p = it.next() orelse return error.MissingValue;
             if (serve_listen) |old| allocator.free(old);
@@ -294,6 +313,13 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
             serve_idle_timeout_secs = std.fmt.parseInt(u32, p, 10) catch return error.InvalidServeNumber;
         } else if (std.mem.startsWith(u8, arg, "--idle-timeout-secs=")) {
             serve_idle_timeout_secs = std.fmt.parseInt(u32, arg["--idle-timeout-secs=".len..], 10) catch return error.InvalidServeNumber;
+        } else if (std.mem.eql(u8, arg, "--n-workers") or std.mem.eql(u8, arg, "--workers")) {
+            const p = it.next() orelse return error.MissingValue;
+            serve_n_workers = parseUsize(p) orelse return error.InvalidServeNumber;
+        } else if (std.mem.startsWith(u8, arg, "--n-workers=")) {
+            serve_n_workers = parseUsize(arg["--n-workers=".len..]) orelse return error.InvalidServeNumber;
+        } else if (std.mem.startsWith(u8, arg, "--workers=")) {
+            serve_n_workers = parseUsize(arg["--workers=".len..]) orelse return error.InvalidServeNumber;
         } else if (std.mem.eql(u8, arg, "--connect")) {
             const p = it.next() orelse return error.MissingValue;
             if (client_connect) |old| allocator.free(old);
@@ -381,11 +407,14 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
         .bench_json = bench_json,
         .bench_transport = bench_transport,
         .bench_protocol = bench_protocol,
+        .bench_concurrent_clients = bench_concurrent_clients,
+        .bench_server_workers = bench_server_workers,
         .serve_listen = serve_listen,
         .serve_auto_snapshot_secs = serve_auto_snapshot_secs,
         .serve_max_connections = serve_max_connections,
         .serve_max_frame_bytes = serve_max_frame_bytes,
         .serve_idle_timeout_secs = serve_idle_timeout_secs,
+        .serve_n_workers = serve_n_workers,
         .client_verb = client_verb,
         .client_connect = client_connect,
         .client_pos0 = client_pos0,
@@ -584,7 +613,7 @@ pub fn parseOrExit(allocator: std.mem.Allocator) Args {
     };
 }
 
-// ── tests ──────────────────────────────────────────────────────────────
+
 
 const testing = std.testing;
 

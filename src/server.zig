@@ -1,18 +1,26 @@
-//! TCP reactor for the `hnswz serve` subcommand.
+//! TCP server for the `hnswz serve` subcommand.
 //!
-//! Single-threaded `std.posix.poll` loop. Each connection runs a state
-//! machine (`read_header → read_body → dispatch → write_response`) on a
-//! pair of preallocated buffers. No allocation in the hot path.
+//!   * Main thread: kqueue-driven event loop (`src/io/darwin.zig`).
+//!     Accepts new connections, runs the per-connection state machine
+//!     (`read_header → read_body → dispatch → write_response`), and
+//!     dispatches to the worker pool.
 //!
-//! The `HnswIndex` and `Workspace` are not thread-safe, so everything
-//! happens on the reactor thread — which also gives us mutex-free
-//! dispatch. The trade-off is that blocking work (embedder HTTP calls on
-//! the `_TEXT` opcodes) stalls all connections until it returns; clients
-//! that need high throughput should pre-compute vectors and use the
-//! `_VEC` variants. See README for details.
+//!   * Worker pool (`src/dispatcher.zig`): N threads, each with its own
+//!     `HnswIndex.Workspace`, vector scratch, and results scratch. A
+//!     `std.Thread.RwLock` protects the shared store/index/metadata —
+//!     searches take it shared, writes take it exclusive.
 //!
-//! The protocol is defined in `protocol.zig`; this module is purely
-//! transport + dispatch.
+//!   * Cross-thread wakeup: workers post results to a done queue and
+//!     write one byte to a pipe. The main thread registers a
+//!     `readReady` completion on the pipe's read end, drains the done
+//!     queue, and submits `writeReady` for each response.
+//!
+//! This departs from TigerBeetle's pure single-threaded model: our
+//! HNSW ops (~19 ms insert, ~4 ms search at dim=4096) are not bounded
+//! enough to run inline on the loop.
+//!
+//! The protocol lives in `protocol.zig`; this module is pure transport +
+//! dispatch.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,13 +34,14 @@ const ollama = @import("ollama.zig");
 const config_mod = @import("config.zig");
 const heap = @import("heap.zig");
 const metadata = @import("metadata.zig");
+const io_mod = @import("io.zig");
+const IO = io_mod.IO;
+const dispatcher_mod = @import("dispatcher.zig");
 
 const log = std.log.scoped(.server);
 
-/// Cap emitted name bytes in SEARCH responses. Per-result names are
-/// expected to be short filenames; we clip at this to bound the
-/// worst-case response size used when sizing per-connection write
-/// buffers.
+/// Cap emitted name bytes in SEARCH responses. Duplicated across
+/// server.zig and dispatcher.zig to keep the dispatcher self-contained.
 pub const MAX_NAME_IN_RESPONSE: usize = 256;
 
 pub const ServeOptions = struct {
@@ -41,29 +50,30 @@ pub const ServeOptions = struct {
     max_connections: u16 = 64,
     max_frame_bytes: u32 = protocol.MAX_FRAME_BYTES_DEFAULT,
     idle_timeout_secs: u32 = 60,
-    auto_snapshot_secs: u32 = 0, // 0 = disabled
+    auto_snapshot_secs: u32 = 0,
     reuse_address: bool = true,
-    /// If true, the reactor will NOT attempt a snapshot on shutdown.
-    /// Tests enable this to avoid touching the filesystem implicitly.
     skip_final_snapshot: bool = false,
-    /// If provided, subcommand wires a SIGINT/SIGTERM handler to set this
-    /// flag. Tests pass their own pointer and skip signal installation.
     shutdown_flag: ?*std.atomic.Value(bool) = null,
+
+    /// Worker-pool size. 0 = auto (cpu_count - 2, clamped to at least 1).
+    n_workers: usize = 0,
 };
 
-// ── signal handling ───────────────────────────────────────────────────
+// The signal handler sets an atomic flag AND writes one byte to
+// `g_sig_wake_w` so the main loop's kevent wakes immediately instead of
+// waiting for the next tick. `write(2)` is async-signal-safe per POSIX.
 
-/// Pointer the sighandler flips. Written once by `installSignalHandlers`.
-/// Handlers run at signal-delivery time with no user context, so we have
-/// to route through a module-level variable.
 var g_sig_flag_ptr: ?*std.atomic.Value(bool) = null;
+var g_sig_wake_w: posix.fd_t = -1;
 
 fn sigHandler(_: i32) callconv(.c) void {
     if (g_sig_flag_ptr) |p| p.store(true, .monotonic);
+    if (g_sig_wake_w >= 0) _ = posix.write(g_sig_wake_w, "s") catch {};
 }
 
-pub fn installSignalHandlers(flag: *std.atomic.Value(bool)) void {
+pub fn installSignalHandlers(flag: *std.atomic.Value(bool), wake_w: posix.fd_t) void {
     g_sig_flag_ptr = flag;
+    g_sig_wake_w = wake_w;
 
     const mask = posix.sigemptyset();
     const act: posix.Sigaction = .{
@@ -83,57 +93,28 @@ pub fn installSignalHandlers(flag: *std.atomic.Value(bool)) void {
     posix.sigaction(posix.SIG.PIPE, &ign, null);
 }
 
-// ── handler error taxonomy ────────────────────────────────────────────
-
-pub const HandlerError = error{
-    InvalidFrame,
-    UnsupportedOpcode,
-    OutOfCapacity,
-    InvalidId,
-    DimMismatch,
-    TextTooLong,
-    EmbedFailed,
-    IoError,
-    SnapshotFailed,
-    TopKTooLarge,
-    Busy,
-    Internal,
+const ConnState = enum {
+    inactive,
+    read_header,
+    read_body,
+    awaiting_worker,
+    write_response,
 };
 
-fn handlerErrToStatus(e: HandlerError) protocol.Status {
-    return switch (e) {
-        error.InvalidFrame => .invalid_frame,
-        error.UnsupportedOpcode => .unsupported_opcode,
-        error.OutOfCapacity => .out_of_capacity,
-        error.InvalidId => .invalid_id,
-        error.DimMismatch => .dim_mismatch,
-        error.TextTooLong => .text_too_long,
-        error.EmbedFailed => .embed_failed,
-        error.IoError => .io_error,
-        error.SnapshotFailed => .snapshot_failed,
-        error.TopKTooLarge => .top_k_too_large,
-        error.Busy => .busy,
-        error.Internal => .internal,
-    };
-}
-
-// ── connection state machine ──────────────────────────────────────────
-
-const ConnState = enum { inactive, read_header, read_body, write_response };
-
 const Connection = struct {
-    stream: std.net.Stream,
-    state: ConnState,
-    read_buf: []u8,
-    write_buf: []u8,
-    read_pos: usize,
-    header: protocol.Header,
-    write_pos: usize,
-    write_end: usize,
-    last_activity_ns: i128,
-    /// When true, close the connection cleanly once the current response
-    /// has been drained. Set on CLOSE opcode.
-    close_after_write: bool,
+    fd: posix.fd_t = -1,
+    state: ConnState = .inactive,
+    read_buf: []u8 = &.{},
+    write_buf: []u8 = &.{},
+    read_pos: usize = 0,
+    header: protocol.Header = .{ .body_len = 0, .tag = 0, .req_id = 0 },
+    write_pos: usize = 0,
+    write_end: usize = 0,
+    last_activity_ns: i128 = 0,
+    /// When set, close after draining the current write.
+    close_after_write: bool = false,
+    /// Completion for the IO wait on this conn. Only one at a time.
+    io_completion: IO.Completion = .{},
 };
 
 fn setNonBlocking(fd: posix.fd_t) !void {
@@ -142,60 +123,71 @@ fn setNonBlocking(fd: posix.fd_t) !void {
     _ = try posix.fcntl(fd, posix.F.SETFL, current | @as(usize, nonblock_u32));
 }
 
-// ── Server ────────────────────────────────────────────────────────────
+/// Rough ceiling on how often we recompute idle-timeouts / auto-snapshot.
+/// 100 ms is tight enough for tests and lax enough for production.
+const tick_interval_ns: i64 = 100 * std.time.ns_per_ms;
 
 pub fn Server(comptime M: usize) type {
     const Index = HnswIndexFn(M);
+    const Dispatcher = dispatcher_mod.Dispatcher(M);
 
     return struct {
         const Self = @This();
         pub const IndexType = Index;
 
-        // deps
         allocator: std.mem.Allocator,
         store: *Store,
         index: *Index,
         metadata: *MutableMetadata,
         embedder: ?ollama.Embedder,
-        ws: *Index.Workspace,
         cfg: *const config_mod.Config,
         opts: ServeOptions,
 
-        // networking state
         listener: std.net.Server,
         bound_port: u16,
 
-        // Parallel arrays. poll_fds[0] is the listener; poll_fds[i+1]
-        // corresponds to conns[i]. Inactive slots carry `fd = -1` so
-        // `poll(2)` ignores them (POSIX: negative fds are skipped).
-        poll_fds: []posix.pollfd,
+        io: IO,
+        accept_completion: IO.Completion = .{},
+        wake_completion: IO.Completion = .{},
+        shutdown_completion: IO.Completion = .{},
+        tick_completion: IO.Completion = .{},
+
+        /// Signal handler writes one byte here; main thread's readReady
+        /// callback flips the shutdown flag.
+        shutdown_r: posix.fd_t,
+        shutdown_w: posix.fd_t,
+
         conns: []Connection,
-
-        // scratch
-        vec_scratch: []align(4) f32,
-        results_scratch: []heap.Entry,
-        text_scratch: []u8,
-
         per_conn_buf_size: usize,
 
-        // snapshot cadence
+        dispatcher: Dispatcher,
+
+        /// Points at the caller-provided flag (or our own fallback when
+        /// none was provided). Checked between runForNs iterations.
+        shutdown_flag: *std.atomic.Value(bool),
+        /// Backing storage when the caller didn't pass `opts.shutdown_flag`.
+        own_shutdown_flag: std.atomic.Value(bool) = .init(false),
+
         snapshot_interval_ns: i128,
         last_snapshot_ns: i128,
+
+        /// Small scratch for the auto-snapshot response payload. The
+        /// internal snapshot has nowhere to send this, but handlers
+        /// write here unconditionally.
+        snap_scratch: [64]u8 = undefined,
 
         pub fn init(
             allocator: std.mem.Allocator,
             store: *Store,
             index: *Index,
             md: *MutableMetadata,
-            ws: *Index.Workspace,
             embedder: ?ollama.Embedder,
             cfg: *const config_mod.Config,
             opts: ServeOptions,
         ) !Self {
-            // Size per-connection read/write buffers for the largest
-            // reasonable frame in either direction. SEARCH responses are
-            // sized with MAX_NAME_IN_RESPONSE capped per result; names
-            // exceeding that get clipped at emit time.
+            // Per-connection buffer sizing — same policy as the old
+            // reactor. Worst-case across INSERT_TEXT payload, INSERT_VEC
+            // payload, and SEARCH response.
             const header_overhead = protocol.FRAME_HEADER_SIZE + 16;
             const search_resp_max = protocol.FRAME_HEADER_SIZE + 2 +
                 cfg.index.max_ef * (10 + MAX_NAME_IN_RESPONSE);
@@ -203,63 +195,48 @@ pub fn Server(comptime M: usize) type {
             const vec_max = protocol.FRAME_HEADER_SIZE + cfg.embedder.dim * 4 + header_overhead;
             const per_conn_buf_size = @max(text_max, @max(vec_max, search_resp_max)) + 4096;
 
-            // listener
             const addr = try std.net.Address.parseIp(opts.listen_addr, opts.listen_port);
             var listener = try addr.listen(.{
                 .reuse_address = opts.reuse_address,
             });
             errdefer listener.deinit();
-
-            // The listener fd is blocking by default, which is fine: we
-            // only call accept() after poll() tells us there's a pending
-            // connection.
-
+            // Listener stays blocking; accept(2) is gated by kqueue so
+            // we only call it when there's a pending connection.
             const bound = listener.listen_address;
             const bound_port: u16 = bound.getPort();
 
-            // poll fds: [listener, conn0, conn1, ...]
-            const poll_fds = try allocator.alloc(posix.pollfd, 1 + @as(usize, opts.max_connections));
-            errdefer allocator.free(poll_fds);
-            for (poll_fds) |*p| p.* = .{ .fd = -1, .events = 0, .revents = 0 };
-            poll_fds[0] = .{
-                .fd = listener.stream.handle,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            };
+            var io = try IO.init(allocator);
+            errdefer io.deinit();
+
+            const fds = try posix.pipe2(.{ .NONBLOCK = true });
+            errdefer posix.close(fds[0]);
+            errdefer posix.close(fds[1]);
 
             const conns = try allocator.alloc(Connection, opts.max_connections);
             errdefer allocator.free(conns);
-            for (conns) |*c| c.* = .{
-                .stream = undefined,
-                .state = .inactive,
-                .read_buf = &.{},
-                .write_buf = &.{},
-                .read_pos = 0,
-                .header = .{ .body_len = 0, .tag = 0, .req_id = 0 },
-                .write_pos = 0,
-                .write_end = 0,
-                .last_activity_ns = 0,
-                .close_after_write = false,
-            };
+            for (conns) |*c| c.* = .{};
 
-            // Preallocate per-connection buffers up front — fits the
-            // project's "preallocate everything" discipline. One flat
-            // slab, one pointer per connection.
-            const read_slab = try allocator.alloc(u8, opts.max_connections * per_conn_buf_size);
+            const read_slab = try allocator.alloc(u8, @as(usize, opts.max_connections) * per_conn_buf_size);
             errdefer allocator.free(read_slab);
-            const write_slab = try allocator.alloc(u8, opts.max_connections * per_conn_buf_size);
+            const write_slab = try allocator.alloc(u8, @as(usize, opts.max_connections) * per_conn_buf_size);
             errdefer allocator.free(write_slab);
             for (conns, 0..) |*c, i| {
                 c.read_buf = read_slab[i * per_conn_buf_size ..][0..per_conn_buf_size];
                 c.write_buf = write_slab[i * per_conn_buf_size ..][0..per_conn_buf_size];
             }
 
-            const vec_scratch = try allocator.alignedAlloc(f32, .@"4", cfg.embedder.dim);
-            errdefer allocator.free(vec_scratch);
-            const results_scratch = try allocator.alloc(heap.Entry, cfg.index.max_ef);
-            errdefer allocator.free(results_scratch);
-            const text_scratch = try allocator.alloc(u8, cfg.embedder.max_text_bytes);
-            errdefer allocator.free(text_scratch);
+            const dispatcher = try Dispatcher.init(
+                allocator,
+                store,
+                index,
+                md,
+                embedder,
+                cfg,
+                .{
+                    .n_workers = opts.n_workers,
+                    .request_pool_size = opts.max_connections,
+                },
+            );
 
             return .{
                 .allocator = allocator,
@@ -267,153 +244,178 @@ pub fn Server(comptime M: usize) type {
                 .index = index,
                 .metadata = md,
                 .embedder = embedder,
-                .ws = ws,
                 .cfg = cfg,
                 .opts = opts,
                 .listener = listener,
                 .bound_port = bound_port,
-                .poll_fds = poll_fds,
+                .io = io,
+                .shutdown_r = fds[0],
+                .shutdown_w = fds[1],
                 .conns = conns,
-                .vec_scratch = vec_scratch,
-                .results_scratch = results_scratch,
-                .text_scratch = text_scratch,
                 .per_conn_buf_size = per_conn_buf_size,
+                .dispatcher = dispatcher,
+                .shutdown_flag = opts.shutdown_flag orelse @as(*std.atomic.Value(bool), undefined), // fixed below
                 .snapshot_interval_ns = @as(i128, opts.auto_snapshot_secs) * std.time.ns_per_s,
                 .last_snapshot_ns = std.time.nanoTimestamp(),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            // close any active connections
             for (self.conns) |*c| {
-                if (c.state != .inactive) c.stream.close();
+                if (c.state != .inactive) {
+                    posix.close(c.fd);
+                    c.fd = -1;
+                }
             }
             self.listener.deinit();
-
-            // one slab each; take the slab pointer from conn[0]
+            // One slab each; take the slab pointer from conn[0].
             if (self.conns.len > 0) {
                 self.allocator.free(self.conns[0].read_buf.ptr[0 .. self.per_conn_buf_size * self.conns.len]);
                 self.allocator.free(self.conns[0].write_buf.ptr[0 .. self.per_conn_buf_size * self.conns.len]);
             }
             self.allocator.free(self.conns);
-            self.allocator.free(self.poll_fds);
-            self.allocator.free(self.vec_scratch);
-            self.allocator.free(self.results_scratch);
-            self.allocator.free(self.text_scratch);
+
+            posix.close(self.shutdown_r);
+            posix.close(self.shutdown_w);
+
+            self.dispatcher.deinit();
+            self.io.deinit();
         }
 
-        /// Main event loop. `shutdown_flag` is polled between poll()
-        /// iterations; flipping it exits the loop. The flag may be
-        /// driven by a signal handler (prod) or directly (tests).
+        /// Main event loop. Called from the main thread.
+        ///
+        /// `shutdown_flag` is the same atomic the caller would have
+        /// passed in `opts.shutdown_flag` (kept as a parameter for API
+        /// compatibility with the pre-rewrite server).
         pub fn run(self: *Self, shutdown_flag: *std.atomic.Value(bool)) !void {
+            self.shutdown_flag = shutdown_flag;
             log.info("listening on {s}:{d}", .{ self.opts.listen_addr, self.bound_port });
 
+            // Spawn worker threads.
+            try self.dispatcher.start();
+            errdefer self.dispatcher.shutdown();
+
+            // Submit long-lived completions.
+            self.io.readReady(*Self, self, onAccept, &self.accept_completion, self.listener.stream.handle);
+            self.io.readReady(*Self, self, onDispatcherDone, &self.wake_completion, self.dispatcher.wake_r);
+            self.io.readReady(*Self, self, onShutdownByte, &self.shutdown_completion, self.shutdown_r);
+            self.io.timeout(*Self, self, onTick, &self.tick_completion, tick_interval_ns);
+
             while (!shutdown_flag.load(.monotonic)) {
-                const timeout_ms = self.computePollTimeoutMs();
-                const n = posix.poll(self.poll_fds, timeout_ms) catch |err| switch (err) {
-                    error.SystemResources => {
-                        log.warn("poll failed with system resources; retrying", .{});
-                        continue;
-                    },
-                    else => return err,
-                };
-
-                if (n == 0) {
-                    self.checkIdleTimeouts();
-                    self.maybeAutoSnapshot();
-                    continue;
-                }
-
-                if (self.poll_fds[0].revents & posix.POLL.IN != 0) {
-                    self.handleAccept();
-                }
-
-                for (self.conns, 0..) |*c, i| {
-                    if (c.state == .inactive) continue;
-                    const revents = self.poll_fds[i + 1].revents;
-                    const err_mask = posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
-                    if (revents & err_mask != 0) {
-                        self.closeConn(i);
-                        continue;
-                    }
-                    if (revents & posix.POLL.IN != 0) self.progressRead(i);
-                    if (c.state == .inactive) continue;
-                    if (revents & posix.POLL.OUT != 0) self.progressWrite(i);
-                }
-
-                self.checkIdleTimeouts();
-                self.maybeAutoSnapshot();
+                try self.io.runForNs(tick_interval_ns);
             }
 
             log.info("shutdown requested; flushing snapshot and closing", .{});
+
+            self.dispatcher.shutdown();
+
             if (!self.opts.skip_final_snapshot) self.finalSnapshot();
 
-            // Drain any writing connections briefly, then hard-close all.
             for (self.conns, 0..) |*c, i| {
                 if (c.state != .inactive) self.closeConn(i);
             }
         }
 
-        // ── accept ────────────────────────────────────────────────────
+        /// Convenience: write to our own shutdown pipe, then flip the
+        /// flag. Tests and external callers may use this instead of
+        /// racing on the atomic alone.
+        pub fn requestShutdown(self: *Self) void {
+            _ = posix.write(self.shutdown_w, "s") catch {};
+            self.shutdown_flag.store(true, .monotonic);
+        }
 
-        fn handleAccept(self: *Self) void {
-            const c = self.listener.accept() catch |err| {
-                log.warn("accept failed: {s}", .{@errorName(err)});
+        fn onAccept(self: *Self, _: *IO.Completion, result: IO.Result) void {
+            // Unconditionally re-arm for the next connection. Any error
+            // is fatal-ish but we keep going so the loop doesn't wedge.
+            defer self.io.readReady(*Self, self, onAccept, &self.accept_completion, self.listener.stream.handle);
+
+            switch (result) {
+                .ready => {},
+                else => return,
+            }
+
+            const conn = self.listener.accept() catch |err| {
+                if (err != error.WouldBlock) {
+                    log.warn("accept failed: {s}", .{@errorName(err)});
+                }
                 return;
             };
+
             // Find an inactive slot.
-            var slot: ?usize = null;
+            var slot_opt: ?usize = null;
             for (self.conns, 0..) |*cc, i| {
                 if (cc.state == .inactive) {
-                    slot = i;
+                    slot_opt = i;
                     break;
                 }
             }
-            if (slot == null) {
+            const slot = slot_opt orelse {
                 log.info("rejecting accept: max_connections reached", .{});
-                c.stream.close();
+                conn.stream.close();
                 return;
-            }
-            const i = slot.?;
+            };
 
-            setNonBlocking(c.stream.handle) catch |err| {
+            setNonBlocking(conn.stream.handle) catch |err| {
                 log.warn("failed to set non-blocking: {s}", .{@errorName(err)});
-                c.stream.close();
+                conn.stream.close();
                 return;
             };
 
-            self.conns[i] = .{
-                .stream = c.stream,
-                .state = .read_header,
-                .read_buf = self.conns[i].read_buf,
-                .write_buf = self.conns[i].write_buf,
-                .read_pos = 0,
-                .header = .{ .body_len = 0, .tag = 0, .req_id = 0 },
-                .write_pos = 0,
-                .write_end = 0,
-                .last_activity_ns = std.time.nanoTimestamp(),
-                .close_after_write = false,
-            };
-            self.poll_fds[i + 1] = .{
-                .fd = c.stream.handle,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            };
+            const c = &self.conns[slot];
+            c.fd = conn.stream.handle;
+            c.state = .read_header;
+            c.read_pos = 0;
+            c.header = .{ .body_len = 0, .tag = 0, .req_id = 0 };
+            c.write_pos = 0;
+            c.write_end = 0;
+            c.last_activity_ns = std.time.nanoTimestamp();
+            c.close_after_write = false;
+
+            // Arm the first readReady for this conn.
+            self.armRead(slot);
         }
 
         fn closeConn(self: *Self, i: usize) void {
             const c = &self.conns[i];
             if (c.state == .inactive) return;
-            c.stream.close();
+            posix.close(c.fd);
+            c.fd = -1;
             c.state = .inactive;
             c.read_pos = 0;
             c.write_pos = 0;
             c.write_end = 0;
             c.close_after_write = false;
-            self.poll_fds[i + 1] = .{ .fd = -1, .events = 0, .revents = 0 };
         }
 
-        // ── progress read ────────────────────────────────────────────
+        // Convenience: look up the conn slot for a completion.
+        fn connIndexFor(self: *Self, c: *IO.Completion) usize {
+            const base = @intFromPtr(&self.conns[0].io_completion);
+            const step = @sizeOf(Connection);
+            const idx = (@intFromPtr(c) - base) / step;
+            std.debug.assert(idx < self.conns.len);
+            return idx;
+        }
+
+        fn armRead(self: *Self, i: usize) void {
+            const c = &self.conns[i];
+            self.io.readReady(*Self, self, onConnReadReady, &c.io_completion, c.fd);
+        }
+
+        fn onConnReadReady(self: *Self, comp: *IO.Completion, result: IO.Result) void {
+            const i = self.connIndexFor(comp);
+            const c = &self.conns[i];
+            if (c.state != .read_header and c.state != .read_body) return;
+
+            switch (result) {
+                .ready => {},
+                else => {
+                    self.closeConn(i);
+                    return;
+                },
+            }
+
+            self.progressRead(i);
+        }
 
         fn progressRead(self: *Self, i: usize) void {
             const c = &self.conns[i];
@@ -423,31 +425,43 @@ pub fn Server(comptime M: usize) type {
                 .read_body => protocol.totalFrameSize(c.header),
                 else => return,
             };
-            if (c.read_pos >= need) return;
+            if (c.read_pos >= need) {
+                self.tryAdvance(i);
+                return;
+            }
 
             const dst = c.read_buf[c.read_pos..need];
-            const n = posix.read(c.stream.handle, dst) catch |err| switch (err) {
-                error.WouldBlock => return,
+            const n = posix.read(c.fd, dst) catch |err| switch (err) {
+                error.WouldBlock => {
+                    // Nothing ready yet — re-arm.
+                    self.armRead(i);
+                    return;
+                },
                 else => {
                     self.closeConn(i);
                     return;
                 },
             };
             if (n == 0) {
-                // peer half-closed
+                // Peer closed.
                 self.closeConn(i);
                 return;
             }
             c.read_pos += n;
             c.last_activity_ns = std.time.nanoTimestamp();
 
-            // State transition. Loop so that a single `read` that
-            // delivered the whole frame (header+body together) progresses
-            // all the way to dispatch without waiting for another poll.
+            self.tryAdvance(i);
+        }
+
+        fn tryAdvance(self: *Self, i: usize) void {
+            const c = &self.conns[i];
             while (true) {
                 switch (c.state) {
                     .read_header => {
-                        if (c.read_pos < protocol.FRAME_HEADER_SIZE) return;
+                        if (c.read_pos < protocol.FRAME_HEADER_SIZE) {
+                            self.armRead(i);
+                            return;
+                        }
                         const h = protocol.decodeHeader(
                             c.read_buf[0..protocol.FRAME_HEADER_SIZE],
                             self.opts.max_frame_bytes,
@@ -463,16 +477,18 @@ pub fn Server(comptime M: usize) type {
                         c.header = h;
                         c.state = .read_body;
                         if (total == protocol.FRAME_HEADER_SIZE) {
-                            // no payload; dispatch straight away
                             self.dispatch(i);
                             return;
                         }
-                        // fall through to potentially dispatch if payload
-                        // already buffered.
+                        // Fall through: we may have body bytes queued in
+                        // the same recv.
                     },
                     .read_body => {
                         const total = protocol.totalFrameSize(c.header);
-                        if (c.read_pos < total) return;
+                        if (c.read_pos < total) {
+                            self.armRead(i);
+                            return;
+                        }
                         self.dispatch(i);
                         return;
                     },
@@ -481,79 +497,175 @@ pub fn Server(comptime M: usize) type {
             }
         }
 
-        // ── dispatch ─────────────────────────────────────────────────
-
         fn dispatch(self: *Self, i: usize) void {
             const c = &self.conns[i];
             const header = c.header;
             const payload = c.read_buf[protocol.FRAME_HEADER_SIZE..][0..protocol.payloadLen(header)];
-
-            const w = c.write_buf;
-            // Reserve room for the response header; payload writes start
-            // at offset FRAME_HEADER_SIZE.
-            var payload_end: usize = protocol.FRAME_HEADER_SIZE;
-            var status: protocol.Status = .ok;
-
             const opcode: protocol.Opcode = @enumFromInt(header.tag);
-            const handler_result: HandlerError!usize = switch (opcode) {
-                .ping => self.handlePing(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .stats => self.handleStats(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .insert_vec => self.handleInsertVec(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .insert_text => self.handleInsertText(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .delete => self.handleDelete(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .replace_vec => self.handleReplaceVec(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .replace_text => self.handleReplaceText(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .get => self.handleGet(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .search_vec => self.handleSearchVec(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .search_text => self.handleSearchText(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .snapshot => self.handleSnapshot(payload, w[protocol.FRAME_HEADER_SIZE..]),
-                .close => blk: {
-                    c.close_after_write = true;
-                    break :blk self.handlePing(payload, w[protocol.FRAME_HEADER_SIZE..]);
-                },
-                _ => HandlerError.UnsupportedOpcode,
-            };
 
-            if (handler_result) |n| {
-                payload_end += n;
-            } else |err| {
-                status = handlerErrToStatus(err);
-                const msg = protocol.statusMessage(status);
-                payload_end = protocol.FRAME_HEADER_SIZE + protocol.encodeErrorPayload(
-                    w[protocol.FRAME_HEADER_SIZE..],
-                    msg,
-                );
+            // PING and CLOSE stay on the main thread — they do no real
+            // work and going through the worker pool would skew the
+            // protocol-floor benchmarks and add latency.
+            switch (opcode) {
+                .ping => {
+                    if (payload.len != 0) {
+                        self.writeImmediateErr(i, .invalid_frame);
+                    } else {
+                        self.writeImmediateOk(i, 0);
+                    }
+                    return;
+                },
+                .close => {
+                    c.close_after_write = true;
+                    self.writeImmediateOk(i, 0);
+                    return;
+                },
+                else => {},
             }
 
-            const body_len: u32 = @intCast(payload_end - 4);
+            // Anything else: grab a pooled request, fill it in, submit.
+            const req = self.dispatcher.acquireRequest() orelse {
+                // Pool exhausted → server is saturated. Respond BUSY so
+                // the client can retry. Keeps the connection alive.
+                self.writeImmediateErr(i, .busy);
+                return;
+            };
+            req.conn_idx = i;
+            req.req_id = header.req_id;
+            req.opcode = opcode;
+            req.payload = payload;
+            req.response_buf = c.write_buf[protocol.FRAME_HEADER_SIZE..];
+            req.status = .ok;
+            req.response_len = 0;
+
+            c.state = .awaiting_worker;
+            c.read_pos = 0; // fresh header when worker is done
+            self.dispatcher.submit(req);
+        }
+
+        /// Encode (status, 0-length payload) into conn.write_buf and
+        /// start the write phase. For ops handled synchronously on the
+        /// main thread (PING, CLOSE).
+        fn writeImmediateOk(self: *Self, i: usize, payload_len: usize) void {
+            const c = &self.conns[i];
+            const body_len: u32 = @intCast(5 + payload_len);
             protocol.encodeHeader(
-                w[0..protocol.FRAME_HEADER_SIZE],
+                c.write_buf[0..protocol.FRAME_HEADER_SIZE],
                 body_len,
-                @intFromEnum(status),
-                header.req_id,
+                @intFromEnum(protocol.Status.ok),
+                c.header.req_id,
             );
-
             c.write_pos = 0;
-            c.write_end = payload_end;
+            c.write_end = protocol.FRAME_HEADER_SIZE + payload_len;
             c.state = .write_response;
-            c.read_pos = 0; // start fresh header next time
-            self.poll_fds[i + 1].events = posix.POLL.OUT;
-
-            // Best-effort immediate drain — saves a poll round-trip on
-            // the common case where kernel send buffer has space.
+            c.read_pos = 0;
             self.progressWrite(i);
         }
 
-        // ── progress write ───────────────────────────────────────────
+        fn writeImmediateErr(self: *Self, i: usize, status: protocol.Status) void {
+            const c = &self.conns[i];
+            const msg = protocol.statusMessage(status);
+            const payload_len = protocol.encodeErrorPayload(
+                c.write_buf[protocol.FRAME_HEADER_SIZE..],
+                msg,
+            );
+            const body_len: u32 = @intCast(5 + payload_len);
+            protocol.encodeHeader(
+                c.write_buf[0..protocol.FRAME_HEADER_SIZE],
+                body_len,
+                @intFromEnum(status),
+                c.header.req_id,
+            );
+            c.write_pos = 0;
+            c.write_end = protocol.FRAME_HEADER_SIZE + payload_len;
+            c.state = .write_response;
+            c.read_pos = 0;
+            self.progressWrite(i);
+        }
 
-        fn progressWrite(self: *Self, i: usize) void {
+        fn onDispatcherDone(self: *Self, _: *IO.Completion, result: IO.Result) void {
+            // Always re-arm the read on the wake pipe. Worker bytes may
+            // arrive in the interval between drain and re-arm; those
+            // will wake the next readiness edge.
+            defer self.io.readReady(
+                *Self,
+                self,
+                onDispatcherDone,
+                &self.wake_completion,
+                self.dispatcher.wake_r,
+            );
+
+            switch (result) {
+                .ready => {},
+                else => return,
+            }
+
+            var out: [32]*dispatcher_mod.InflightRequest = undefined;
+            while (true) {
+                const n = self.dispatcher.drainDone(&out);
+                if (n == 0) break;
+                for (out[0..n]) |req| {
+                    self.onRequestDone(req);
+                }
+                if (n < out.len) break;
+            }
+        }
+
+        fn onRequestDone(self: *Self, req: *dispatcher_mod.InflightRequest) void {
+            const i = req.conn_idx;
+            const c = &self.conns[i];
+            // Encode the frame header. The worker has already placed
+            // the response payload at write_buf[FRAME_HEADER_SIZE..].
+            const payload_end = protocol.FRAME_HEADER_SIZE + req.response_len;
+            const body_len: u32 = @intCast(5 + req.response_len);
+            protocol.encodeHeader(
+                c.write_buf[0..protocol.FRAME_HEADER_SIZE],
+                body_len,
+                @intFromEnum(req.status),
+                req.req_id,
+            );
+            c.write_pos = 0;
+            c.write_end = payload_end;
+            c.state = .write_response;
+            c.read_pos = 0;
+
+            self.dispatcher.releaseRequest(req);
+
+            // Attempt an immediate drain — saves a kevent round-trip on
+            // the common case where the kernel's send buffer has room.
+            self.progressWrite(i);
+        }
+
+        fn armWrite(self: *Self, i: usize) void {
+            const c = &self.conns[i];
+            self.io.writeReady(*Self, self, onConnWriteReady, &c.io_completion, c.fd);
+        }
+
+        fn onConnWriteReady(self: *Self, comp: *IO.Completion, result: IO.Result) void {
+            const i = self.connIndexFor(comp);
             const c = &self.conns[i];
             if (c.state != .write_response) return;
 
+            switch (result) {
+                .ready => {},
+                else => {
+                    self.closeConn(i);
+                    return;
+                },
+            }
+
+            self.progressWrite(i);
+        }
+
+        fn progressWrite(self: *Self, i: usize) void {
+            const c = &self.conns[i];
             while (c.write_pos < c.write_end) {
                 const slice = c.write_buf[c.write_pos..c.write_end];
-                const n = posix.write(c.stream.handle, slice) catch |err| switch (err) {
-                    error.WouldBlock => return, // wait for next POLL.OUT
+                const n = posix.write(c.fd, slice) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        self.armWrite(i);
+                        return;
+                    },
                     else => {
                         self.closeConn(i);
                         return;
@@ -567,194 +679,79 @@ pub fn Server(comptime M: usize) type {
                 c.last_activity_ns = std.time.nanoTimestamp();
             }
 
-            // Response fully drained.
             if (c.close_after_write) {
                 self.closeConn(i);
                 return;
             }
             c.state = .read_header;
-            self.poll_fds[i + 1].events = posix.POLL.IN;
+            c.read_pos = 0;
+            self.armRead(i);
         }
 
-        // ── handlers ─────────────────────────────────────────────────
-
-        fn handlePing(_: *Self, payload: []const u8, _: []u8) HandlerError!usize {
-            if (payload.len != 0) return error.InvalidFrame;
-            return 0;
+        fn onTick(self: *Self, _: *IO.Completion, _: IO.Result) void {
+            // Always re-arm.
+            defer self.io.timeout(*Self, self, onTick, &self.tick_completion, tick_interval_ns);
+            self.checkIdleTimeouts();
+            self.maybeAutoSnapshot();
         }
 
-        fn handleStats(self: *Self, payload: []const u8, w: []u8) HandlerError!usize {
-            if (payload.len != 0) return error.InvalidFrame;
-            const has_ep: u8 = if (self.index.entry_point != null) 1 else 0;
-            const s: protocol.StatsResponse = .{
-                .proto_version = protocol.PROTO_VERSION,
-                .flags = 0,
-                .dim = @intCast(self.store.dim),
-                .m = @intCast(M),
-                .live_count = @intCast(self.store.live_count),
-                .high_water = @intCast(self.store.count),
-                .upper_used = @intCast(self.index.upper_used),
-                .max_upper_slots = @intCast(self.index.max_upper_slots),
-                .max_level = self.index.max_level,
-                .has_entry_point = has_ep,
-            };
-            return protocol.encodeStatsResponse(w, s);
-        }
-
-        fn handleInsertVec(self: *Self, payload: []const u8, w: []u8) HandlerError!usize {
-            const view = protocol.decodeInsertVecRequest(payload, self.store.dim) catch |err| switch (err) {
-                error.DimMismatch => return error.DimMismatch,
-                error.Truncated => return error.InvalidFrame,
-                else => return error.Internal,
-            };
-            @memcpy(std.mem.sliceAsBytes(self.vec_scratch), view.vec_bytes);
-            const id = self.store.add(self.vec_scratch) catch |err| switch (err) {
-                error.OutOfCapacity => return error.OutOfCapacity,
-            };
-            self.index.insert(self.ws, id) catch {
-                self.store.delete(id);
-                return error.Internal;
-            };
-            self.metadata.setAt(self.allocator, id, "") catch {
-                self.store.delete(id);
-                return error.Internal;
-            };
-            return protocol.encodeIdResponse(w, id);
-        }
-
-        fn handleInsertText(self: *Self, payload: []const u8, w: []u8) HandlerError!usize {
-            const emb = self.embedder orelse return error.EmbedFailed;
-            const view = protocol.decodeInsertTextRequest(payload) catch return error.InvalidFrame;
-            if (view.text.len > self.cfg.embedder.max_text_bytes) return error.TextTooLong;
-
-            emb.embed(view.text, self.vec_scratch) catch {
-                return error.EmbedFailed;
-            };
-            const id = self.store.add(self.vec_scratch) catch |err| switch (err) {
-                error.OutOfCapacity => return error.OutOfCapacity,
-            };
-            self.index.insert(self.ws, id) catch {
-                self.store.delete(id);
-                return error.Internal;
-            };
-
-            // Use the text itself (clipped) as the metadata name so that
-            // SEARCH_TEXT results are actually identifiable.
-            const name_len = @min(view.text.len, MAX_NAME_IN_RESPONSE);
-            self.metadata.setAt(self.allocator, id, view.text[0..name_len]) catch {
-                self.store.delete(id);
-                return error.Internal;
-            };
-            return protocol.encodeIdResponse(w, id);
-        }
-
-        fn handleDelete(self: *Self, payload: []const u8, _: []u8) HandlerError!usize {
-            const id = protocol.decodeIdRequest(payload) catch return error.InvalidFrame;
-            if (@as(usize, id) >= self.store.count) return error.InvalidId;
-            if (self.store.isDeleted(id)) return error.InvalidId;
-            self.index.delete(self.ws, id) catch return error.Internal;
-            self.metadata.deleteAt(self.allocator, id);
-            return 0;
-        }
-
-        fn handleReplaceVec(self: *Self, payload: []const u8, _: []u8) HandlerError!usize {
-            const view = protocol.decodeReplaceVecRequest(payload, self.store.dim) catch |err| switch (err) {
-                error.DimMismatch => return error.DimMismatch,
-                error.Truncated => return error.InvalidFrame,
-                else => return error.Internal,
-            };
-            if (@as(usize, view.id) >= self.store.count) return error.InvalidId;
-            if (self.store.isDeleted(view.id)) return error.InvalidId;
-            @memcpy(std.mem.sliceAsBytes(self.vec_scratch), view.vec_bytes);
-            self.index.replaceVector(self.ws, view.id, self.vec_scratch) catch return error.Internal;
-            return 0;
-        }
-
-        fn handleReplaceText(self: *Self, payload: []const u8, _: []u8) HandlerError!usize {
-            const emb = self.embedder orelse return error.EmbedFailed;
-            const view = protocol.decodeReplaceTextRequest(payload) catch return error.InvalidFrame;
-            if (view.text.len > self.cfg.embedder.max_text_bytes) return error.TextTooLong;
-            if (@as(usize, view.id) >= self.store.count) return error.InvalidId;
-            if (self.store.isDeleted(view.id)) return error.InvalidId;
-            emb.embed(view.text, self.vec_scratch) catch return error.EmbedFailed;
-            self.index.replaceVector(self.ws, view.id, self.vec_scratch) catch return error.Internal;
-
-            const name_len = @min(view.text.len, MAX_NAME_IN_RESPONSE);
-            self.metadata.setAt(self.allocator, view.id, view.text[0..name_len]) catch return error.Internal;
-            return 0;
-        }
-
-        fn handleGet(self: *Self, payload: []const u8, w: []u8) HandlerError!usize {
-            const id = protocol.decodeIdRequest(payload) catch return error.InvalidFrame;
-            if (@as(usize, id) >= self.store.count) return error.InvalidId;
-            if (self.store.isDeleted(id)) return error.InvalidId;
-            const vec = self.store.get(id);
-            const vec_bytes = std.mem.sliceAsBytes(vec);
-            const name_full = self.metadata.get(id) orelse "";
-            const name = name_full[0..@min(name_full.len, MAX_NAME_IN_RESPONSE)];
-            if (w.len < 2 + name.len + vec_bytes.len) return error.Internal;
-            return protocol.encodeGetResponse(w, name, vec_bytes);
-        }
-
-        fn handleSearchVec(self: *Self, payload: []const u8, w: []u8) HandlerError!usize {
-            const view = protocol.decodeSearchVecRequest(payload, self.store.dim) catch |err| switch (err) {
-                error.DimMismatch => return error.DimMismatch,
-                error.Truncated => return error.InvalidFrame,
-                else => return error.Internal,
-            };
-            if (view.top_k == 0) return error.InvalidFrame;
-            if (view.top_k > view.ef) return error.TopKTooLarge;
-            if (view.ef > self.cfg.index.max_ef) return error.TopKTooLarge;
-
-            @memcpy(std.mem.sliceAsBytes(self.vec_scratch), view.vec_bytes);
-            const out_slots = self.results_scratch[0..view.top_k];
-            const results = self.index.search(self.ws, self.vec_scratch, view.top_k, view.ef, out_slots) catch {
-                return error.Internal;
-            };
-            return self.encodeSearchResponse(w, results);
-        }
-
-        fn handleSearchText(self: *Self, payload: []const u8, w: []u8) HandlerError!usize {
-            const emb = self.embedder orelse return error.EmbedFailed;
-            const view = protocol.decodeSearchTextRequest(payload) catch return error.InvalidFrame;
-            if (view.text.len > self.cfg.embedder.max_text_bytes) return error.TextTooLong;
-            if (view.top_k == 0) return error.InvalidFrame;
-            if (view.top_k > view.ef) return error.TopKTooLarge;
-            if (view.ef > self.cfg.index.max_ef) return error.TopKTooLarge;
-
-            emb.embed(view.text, self.vec_scratch) catch return error.EmbedFailed;
-            const out_slots = self.results_scratch[0..view.top_k];
-            const results = self.index.search(self.ws, self.vec_scratch, view.top_k, view.ef, out_slots) catch {
-                return error.Internal;
-            };
-            return self.encodeSearchResponse(w, results);
-        }
-
-        fn encodeSearchResponse(self: *Self, w: []u8, results: []const heap.Entry) HandlerError!usize {
-            var cursor: usize = 0;
-            if (w.len < 2) return error.Internal;
-            cursor += protocol.writeSearchResultCount(w, @intCast(results.len));
-            for (results) |r| {
-                const name_full = self.metadata.get(r.id) orelse "";
-                const name = name_full[0..@min(name_full.len, MAX_NAME_IN_RESPONSE)];
-                const need = 10 + name.len;
-                if (cursor + need > w.len) return error.Internal;
-                cursor += protocol.writeSearchResult(w[cursor..], r.id, r.dist, name);
+        fn checkIdleTimeouts(self: *Self) void {
+            if (self.opts.idle_timeout_secs == 0) return;
+            const cutoff_ns: i128 = std.time.nanoTimestamp() -
+                @as(i128, self.opts.idle_timeout_secs) * std.time.ns_per_s;
+            for (self.conns, 0..) |*c, i| {
+                if (c.state == .inactive) continue;
+                // Don't idle-close a conn with a worker result pending.
+                if (c.state == .awaiting_worker) continue;
+                if (c.last_activity_ns < cutoff_ns) {
+                    log.info("closing idle connection {d}", .{i});
+                    self.closeConn(i);
+                }
             }
-            return cursor;
         }
 
-        fn handleSnapshot(self: *Self, payload: []const u8, w: []u8) HandlerError!usize {
-            if (payload.len != 0) return error.InvalidFrame;
-            const started = std.time.nanoTimestamp();
-            self.snapshotNow() catch return error.SnapshotFailed;
-            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - started);
-            return protocol.encodeSnapshotResponse(w, elapsed);
+        fn maybeAutoSnapshot(self: *Self) void {
+            if (self.snapshot_interval_ns == 0) return;
+            const now = std.time.nanoTimestamp();
+            if (now - self.last_snapshot_ns < self.snapshot_interval_ns) return;
+            const started = now;
+            // Route the snapshot through the dispatcher so it takes the
+            // exclusive lock; we don't block the main loop here.
+            // Simplest way: acquire a request, target SNAPSHOT, submit.
+            const req = self.dispatcher.acquireRequest() orelse return;
+            // We don't have a conn to send the response back to — the
+            // auto-snapshot is internal. We synthesize a detached
+            // request: response_buf = an inline scratch, and on done we
+            // just release it without writing to a conn. A sentinel
+            // conn_idx == max tells onDispatcherDone to skip.
+            req.conn_idx = std.math.maxInt(usize);
+            req.opcode = .snapshot;
+            req.payload = &.{};
+            req.response_buf = self.snap_scratch[0..];
+            req.status = .ok;
+            req.response_len = 0;
+            self.dispatcher.submit(req);
+            self.last_snapshot_ns = started;
         }
 
-        // ── snapshot ─────────────────────────────────────────────────
+        fn onShutdownByte(self: *Self, _: *IO.Completion, result: IO.Result) void {
+            // Drain the pipe; any byte means "shut down".
+            var buf: [16]u8 = undefined;
+            _ = posix.read(self.shutdown_r, &buf) catch {};
+            self.shutdown_flag.store(true, .monotonic);
+            // Don't re-arm — the loop's main `while` will exit.
+            _ = result;
+        }
 
-        fn snapshotNow(self: *Self) !void {
+        fn finalSnapshot(self: *Self) void {
+            // Workers have already stopped by the time we call this.
+            // No concurrency; just do the snapshot directly.
+            self.snapshotInline() catch |err| {
+                log.err("final snapshot failed: {s}", .{@errorName(err)});
+            };
+        }
+
+        fn snapshotInline(self: *Self) !void {
             std.fs.cwd().makePath(self.cfg.storage.data_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
@@ -768,57 +765,13 @@ pub fn Server(comptime M: usize) type {
             try self.store.save(dir, self.cfg.storage.vectors_file);
             try self.index.save(dir, self.cfg.storage.graph_file, remap);
             try self.metadata.save(self.allocator, dir, self.cfg.storage.metadata_file, remap);
-            self.last_snapshot_ns = std.time.nanoTimestamp();
-        }
-
-        fn finalSnapshot(self: *Self) void {
-            self.snapshotNow() catch |err| {
-                log.err("final snapshot failed: {s}", .{@errorName(err)});
-            };
-        }
-
-        // ── periodic maintenance ─────────────────────────────────────
-
-        fn computePollTimeoutMs(_: *const Self) i32 {
-            // 500 ms heartbeat. Bounds shutdown-flag latency and drives
-            // idle-timeout / auto-snapshot checks without a self-pipe.
-            // Cost is one idle poll wake every 500 ms — negligible.
-            return 500;
-        }
-
-        fn checkIdleTimeouts(self: *Self) void {
-            if (self.opts.idle_timeout_secs == 0) return;
-            const cutoff_ns: i128 = std.time.nanoTimestamp() -
-                @as(i128, self.opts.idle_timeout_secs) * std.time.ns_per_s;
-            for (self.conns, 0..) |*c, i| {
-                if (c.state == .inactive) continue;
-                if (c.last_activity_ns < cutoff_ns) {
-                    log.info("closing idle connection {d}", .{i});
-                    self.closeConn(i);
-                }
-            }
-        }
-
-        fn maybeAutoSnapshot(self: *Self) void {
-            if (self.snapshot_interval_ns == 0) return;
-            const now = std.time.nanoTimestamp();
-            if (now - self.last_snapshot_ns < self.snapshot_interval_ns) return;
-            const started = now;
-            self.snapshotNow() catch |err| {
-                log.err("auto-snapshot failed: {s}", .{@errorName(err)});
-                return;
-            };
-            const elapsed = std.time.nanoTimestamp() - started;
-            log.info("auto-snapshot: {d} ns", .{elapsed});
         }
     };
 }
 
-// ── integration tests ────────────────────────────────────────────────
-//
 // Tests spin up the server on 127.0.0.1:0 with a FakeEmbedder and use a
 // blocking client socket for round-trips. The server runs on a worker
-// thread; tests flip a per-test shutdown flag to exit cleanly. Signal
+// thread; tests call `srv.requestShutdown()` to exit cleanly. Signal
 // handlers are NOT installed in tests — they'd pollute the binary.
 
 const testing = std.testing;
@@ -831,7 +784,6 @@ const TestHarness = struct {
     store: Store,
     index: HnswIndexFn(TestM),
     md: MutableMetadata,
-    ws: HnswIndexFn(TestM).Workspace,
     embedder: ollama.FakeEmbedder,
     srv: Server(TestM),
     shutdown: std.atomic.Value(bool),
@@ -874,7 +826,6 @@ const TestHarness = struct {
             .seed = self.cfg.index.seed,
         });
         self.md = MutableMetadata.init();
-        self.ws = try HnswIndexFn(TestM).Workspace.init(allocator, max_vectors, self.cfg.index.max_ef);
         self.embedder = ollama.FakeEmbedder.init(dim, 0x5eed);
         const emb_opt = self.embedder.embedder();
         self.srv = try Server(TestM).init(
@@ -882,18 +833,18 @@ const TestHarness = struct {
             &self.store,
             &self.index,
             &self.md,
-            &self.ws,
             emb_opt,
             &self.cfg,
             .{
                 .listen_addr = "127.0.0.1",
-                .listen_port = 0, // ephemeral
+                .listen_port = 0,
                 .max_connections = max_connections,
                 .max_frame_bytes = 1 << 20,
                 .idle_timeout_secs = 0,
                 .auto_snapshot_secs = 0,
                 .reuse_address = true,
                 .skip_final_snapshot = true,
+                .n_workers = 2, // small but still exercises the pool
             },
         );
     }
@@ -902,15 +853,11 @@ const TestHarness = struct {
         self.thread = try std.Thread.spawn(.{}, runServer, .{self});
     }
 
-    /// Tears everything down in the correct order: signal reactor to
-    /// exit, join the worker thread, then free server + deps. Tests
-    /// MUST `defer h.tearDown()` AFTER `setUp` to keep this one-shot.
     fn tearDown(self: *TestHarness) void {
-        self.shutdown.store(true, .monotonic);
+        self.srv.requestShutdown();
         if (self.thread) |t| t.join();
         self.thread = null;
         self.srv.deinit();
-        self.ws.deinit(self.gpa_allocator);
         self.md.deinit(self.gpa_allocator);
         self.index.deinit();
         self.store.deinit(self.gpa_allocator);
@@ -926,9 +873,6 @@ fn connect(port: u16) !std.net.Stream {
     return try std.net.tcpConnectToAddress(addr);
 }
 
-/// Write a full request frame (9-byte header + payload) and block until
-/// a full response frame has been read. Uses a fixed 1 MB buffer; tests
-/// never exchange larger frames than that.
 fn roundTrip(
     stream: std.net.Stream,
     opcode: protocol.Opcode,
@@ -973,7 +917,7 @@ test "PING round-trip" {
 
     var buf: [64]u8 = undefined;
     const r = try roundTrip(stream, .ping, 0xABCD, "", &buf);
-    try testing.expectEqual(@as(u8, 0), r.header.tag); // status = OK
+    try testing.expectEqual(@as(u8, 0), r.header.tag);
     try testing.expectEqual(@as(u32, 0xABCD), r.header.req_id);
     try testing.expectEqual(@as(usize, 0), r.payload.len);
 }
@@ -1022,7 +966,6 @@ test "INSERT_VEC then SEARCH_VEC finds the inserted vector" {
     const id = try protocol.decodeIdResponse(r.payload);
     try testing.expectEqual(@as(u32, 0), id);
 
-    // search for the same vector
     var sreq: [6 + dim * 4]u8 = undefined;
     const sn = protocol.encodeSearchVecRequest(&sreq, 1, 40, 0, vec_bytes);
     var sresp: [512]u8 = undefined;
@@ -1045,7 +988,6 @@ test "INSERT_VEC with wrong-size body returns DIM_MISMATCH" {
     const stream = try connect(port);
     defer stream.close();
 
-    // dim=8 expected; send 4 floats worth
     var bad_vec: [4]f32 = .{ 1, 2, 3, 4 };
     const bad_bytes = std.mem.sliceAsBytes(bad_vec[0..]);
     var req_buf: [2 + 16]u8 = undefined;
@@ -1074,7 +1016,7 @@ test "DELETE on never-inserted id returns INVALID_ID" {
 test "INSERT_VEC past capacity returns OUT_OF_CAPACITY" {
     var h: TestHarness = undefined;
     const dim: usize = 4;
-    try h.setUp(testing.allocator, dim, 2, 4); // cap = 2
+    try h.setUp(testing.allocator, dim, 2, 4);
     defer h.tearDown();
     const port = h.srv.bound_port;
     try h.start();
@@ -1123,12 +1065,10 @@ test "partial-read: byte-by-byte frame still dispatches" {
     const stream = try connect(port);
     defer stream.close();
 
-    // Build a PING request and write it 1 byte at a time.
     var hdr: [protocol.FRAME_HEADER_SIZE]u8 = undefined;
     protocol.encodeHeader(&hdr, 5, @intFromEnum(protocol.Opcode.ping), 42);
     for (hdr) |b| try stream.writeAll(&[_]u8{b});
 
-    // Read the response header, also 1 byte at a time via blocking read.
     var got: [protocol.FRAME_HEADER_SIZE]u8 = undefined;
     var fill: usize = 0;
     while (fill < protocol.FRAME_HEADER_SIZE) {
@@ -1167,7 +1107,6 @@ test "REPLACE_VEC updates stored vector" {
     const rr = try roundTrip(stream, .replace_vec, 2, rreq[0..rn], &resp);
     try testing.expectEqual(@as(u8, 0), rr.header.tag);
 
-    // GET id 0 and confirm the vec is v1
     var greq: [4]u8 = undefined;
     _ = protocol.encodeIdRequest(&greq, 0);
     const gr = try roundTrip(stream, .get, 3, &greq, &resp);
@@ -1187,7 +1126,6 @@ test "CLOSE opcode closes the connection after ack" {
     defer stream.close();
     var resp: [64]u8 = undefined;
     _ = try roundTrip(stream, .close, 1, "", &resp);
-    // Server should have closed; subsequent read returns 0.
     var trailing: [16]u8 = undefined;
     const n = try stream.read(&trailing);
     try testing.expectEqual(@as(usize, 0), n);
@@ -1214,7 +1152,6 @@ test "SNAPSHOT writes files that round-trip with existing load" {
     try h.setUp(testing.allocator, dim, 8, 4);
     defer h.tearDown();
 
-    // Use a unique per-run directory so tests don't collide.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const real = try tmp.dir.realpathAlloc(testing.allocator, ".");
@@ -1239,7 +1176,6 @@ test "SNAPSHOT writes files that round-trip with existing load" {
     const elapsed = try protocol.decodeSnapshotResponse(sr.payload);
     try testing.expect(elapsed > 0);
 
-    // Verify we can load via the existing non-server APIs.
     var loaded = try Store.load(testing.allocator, tmp.dir, h.cfg.storage.vectors_file, null);
     defer loaded.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), loaded.live_count);
@@ -1267,18 +1203,16 @@ test "multiple sequential requests on one connection" {
 
 test "max_connections: extras get closed immediately" {
     var h: TestHarness = undefined;
-    try h.setUp(testing.allocator, 4, 8, 1); // only 1 slot
+    try h.setUp(testing.allocator, 4, 8, 1);
     defer h.tearDown();
     const port = h.srv.bound_port;
     try h.start();
 
     const s1 = try connect(port);
     defer s1.close();
-    // hold s1 open by sending a ping
     var resp: [64]u8 = undefined;
     _ = try roundTrip(s1, .ping, 1, "", &resp);
 
-    // s2 should be accepted and dropped
     const s2 = try connect(port);
     defer s2.close();
     var buf: [16]u8 = undefined;

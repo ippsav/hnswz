@@ -102,8 +102,6 @@ pub const Client = struct {
         return try connect(allocator, addr, opts);
     }
 
-    // ── framing plumbing ────────────────────────────────────────────
-
     fn nextReqId(self: *Self) u32 {
         const id = self.next_req_id;
         self.next_req_id +%= 1;
@@ -158,8 +156,6 @@ pub const Client = struct {
         self.last_message = "";
         return payload;
     }
-
-    // ── opcodes ─────────────────────────────────────────────────────
 
     pub fn ping(self: *Self) !void {
         _ = try self.sendFrame(.ping, 0);
@@ -306,8 +302,6 @@ pub const Client = struct {
     }
 };
 
-// ── tests (round-trip against the real server) ────────────────────────
-
 const testing = std.testing;
 const server = @import("server.zig");
 const Store = @import("store.zig").Store;
@@ -324,7 +318,6 @@ const ClientTestHarness = struct {
     store: Store,
     index: HnswIndex(TestM),
     md: MutableMetadata,
-    ws: HnswIndex(TestM).Workspace,
     embedder: ollama.FakeEmbedder,
     srv: server.Server(TestM),
     shutdown: std.atomic.Value(bool),
@@ -366,7 +359,6 @@ const ClientTestHarness = struct {
             .seed = self.cfg.index.seed,
         });
         self.md = MutableMetadata.init();
-        self.ws = try HnswIndex(TestM).Workspace.init(allocator, max_vectors, self.cfg.index.max_ef);
         self.embedder = ollama.FakeEmbedder.init(dim, 0xc1_1e_17);
         const emb = self.embedder.embedder();
         self.srv = try server.Server(TestM).init(
@@ -374,7 +366,6 @@ const ClientTestHarness = struct {
             &self.store,
             &self.index,
             &self.md,
-            &self.ws,
             emb,
             &self.cfg,
             .{
@@ -384,6 +375,7 @@ const ClientTestHarness = struct {
                 .reuse_address = true,
                 .skip_final_snapshot = true,
                 .max_connections = 4,
+                .n_workers = 2,
             },
         );
     }
@@ -397,11 +389,10 @@ const ClientTestHarness = struct {
     }
 
     fn tearDown(self: *ClientTestHarness) void {
-        self.shutdown.store(true, .monotonic);
+        self.srv.requestShutdown();
         if (self.thread) |t| t.join();
         self.thread = null;
         self.srv.deinit();
-        self.ws.deinit(self.gpa_allocator);
         self.md.deinit(self.gpa_allocator);
         self.index.deinit();
         self.store.deinit(self.gpa_allocator);

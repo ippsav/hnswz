@@ -19,6 +19,8 @@ pub const protocol = @import("protocol.zig");
 pub const metadata_mut = @import("metadata_mut.zig");
 pub const server = @import("server.zig");
 pub const client = @import("client.zig");
+pub const io = @import("io.zig");
+pub const dispatcher = @import("dispatcher.zig");
 
 test {
     _ = @import("distance.zig");
@@ -34,4 +36,6 @@ test {
     _ = @import("metadata_mut.zig");
     _ = @import("server.zig");
     _ = @import("client.zig");
+    _ = @import("io.zig");
+    _ = @import("dispatcher.zig");
 }
