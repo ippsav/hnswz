@@ -96,6 +96,8 @@ Flags:
 | `--warmup <n>` | `50` | untimed warmup queries |
 | `--validate` | off | compute recall@k against brute force |
 | `--json` | off | machine-readable output |
+| `--concurrent-clients <n>` | `1` | TCP search phase clients in parallel (driver threads) |
+| `--server-workers <n>` | `0` (auto) | TCP server worker-pool size |
 
 > Run release-mode for meaningful numbers: `zig build -Doptimize=ReleaseFast`.
 
@@ -123,6 +125,7 @@ Flags:
 | `--max-connections <n>` | `64` | concurrent connection cap |
 | `--max-frame-bytes <n>` | `64 MiB` | reject frames larger than this |
 | `--idle-timeout-secs <n>` | `60` | close idle connections |
+| `--workers <n>` | `0` (auto = cpu-2) | worker-pool size for HNSW compute |
 
 **Wire format.** Every frame is a 9-byte header (`u32 body_len | u8
 opcode_or_status | u32 req_id`) followed by an opcode-specific payload.
@@ -130,18 +133,19 @@ All multi-byte fields are little-endian, matching the on-disk HVSF/HGRF
 formats. See [src/protocol.zig](src/protocol.zig) for the authoritative
 spec and every opcode's exact byte layout.
 
-**Concurrency.** Single-threaded `poll(2)` reactor. `HnswIndex` and its
-`Workspace` are not thread-safe, and a global mutex gives zero throughput
-win over serial dispatch; the reactor gets the same throughput without
-locks or per-thread scratch duplication. Partial reads AND partial writes
-are handled — the connection state machine survives short `read`/`write`
-returns and kernel back-pressure.
+**Concurrency.** Main thread runs a kqueue-driven event loop
+([src/io/darwin.zig](src/io/darwin.zig)) that handles accept, the
+per-connection read/write state machine, and dispatch. HNSW compute runs
+on a pool of worker threads ([src/dispatcher.zig](src/dispatcher.zig)),
+each with its own `Workspace` and scratch. A `std.Thread.RwLock` guards
+the `Store` / `HnswIndex` / `MutableMetadata` triple — searches hold it
+shared, inserts/deletes/replace/snapshot hold it exclusive. Workers post
+results back over a pipe the loop reads; no polling.
 
-**Known limitation.** The `_TEXT` opcodes (`INSERT_TEXT`, `SEARCH_TEXT`,
-`REPLACE_TEXT`) synchronously call Ollama's embed HTTP endpoint from the
-reactor thread, which means a slow embed stalls all connections. Clients
-that need throughput should pre-compute vectors and use the `_VEC`
-variants instead. (WIP)
+**Text opcodes.** `INSERT_TEXT` / `SEARCH_TEXT` / `REPLACE_TEXT` do the
+Ollama HTTP call outside the lock, so a slow embed no longer stalls
+other clients. Still, pre-computed `_VEC` variants skip the HTTP
+round-trip entirely and are preferred on the hot path.
 
 **Durability.** Writes live in memory until a snapshot fires. Snapshots
 are triggered explicitly via the `SNAPSHOT` opcode, on the
