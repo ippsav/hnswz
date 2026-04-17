@@ -59,6 +59,17 @@ pub const Options = struct {
     /// measure PING RTT and 1-vector SEARCH_VEC RTT via TCP. Implies
     /// `transport == .tcp`.
     bench_protocol: bool = false,
+    /// For `.tcp`: how many clients drive load in parallel during the
+    /// search phase (and PING/SEARCH RTT phases of `--bench-protocol`).
+    /// Build phase is always single-client (inserts serialize on the
+    /// writer anyway). Default 1 = old behaviour.
+    concurrent_clients: usize = 1,
+    /// For `.tcp`: worker-pool size passed to the server. 0 = auto
+    /// (cpu_count - 2). Only meaningful under `transport == .tcp`.
+    server_n_workers: usize = 0,
+    /// For `.tcp`: size of the server's connection table. Must be >=
+    /// `concurrent_clients` to avoid connection rejections. Default 64.
+    tcp_max_connections: u16 = 64,
 };
 
 /// Fixed-capacity linear-bucket latency histogram.
@@ -129,6 +140,18 @@ pub const Histogram = struct {
     /// is polluted with over-range values and tail percentiles understate.
     pub fn overflowed(self: *const Histogram) bool {
         return self.max_sample_ns >= self.buckets.len * self.bucket_ns;
+    }
+
+    /// Fold `other` into `self`. Both histograms must have identical
+    /// `buckets.len` and `bucket_ns`. Used by the concurrent-clients
+    /// search driver to merge per-thread histograms.
+    pub fn merge(self: *Histogram, other: *const Histogram) void {
+        std.debug.assert(self.buckets.len == other.buckets.len);
+        std.debug.assert(self.bucket_ns == other.bucket_ns);
+        for (self.buckets, other.buckets) |*a, b| a.* += b;
+        self.samples += other.samples;
+        self.sum_ns += other.sum_ns;
+        if (other.max_sample_ns > self.max_sample_ns) self.max_sample_ns = other.max_sample_ns;
     }
 };
 
@@ -202,8 +225,6 @@ fn runInProcess(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer
         , .{});
     }
 
-    // ── setup (untimed) ─────────────────────────────────────────────
-
     var store = try Store.init(allocator, opts.dim, opts.num_vectors);
     defer store.deinit(allocator);
 
@@ -246,8 +267,6 @@ fn runInProcess(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer
         }
     }
 
-    // ── build phase ─────────────────────────────────────────────────
-
     const Index = HnswIndexFn(M);
     var index = try Index.init(allocator, &store, .{
         .max_vectors = opts.num_vectors,
@@ -271,8 +290,6 @@ fn runInProcess(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer
     }
     const build_wall_ns = build_wall.read();
     const build_stats = phaseStatsFrom(&build_hist, build_wall_ns);
-
-    // ── search phase ────────────────────────────────────────────────
 
     const results_buf = try allocator.alloc(heap.Entry, opts.top_k);
     defer allocator.free(results_buf);
@@ -323,8 +340,6 @@ fn runInProcess(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer
     if (opts.json) try writeJson(out, report) else try writePretty(out, report);
     try out.flush();
 }
-
-// ── output formats ────────────────────────────────────────────────────
 
 fn writePretty(w: *std.io.Writer, r: Report) !void {
     try w.print(
@@ -425,8 +440,6 @@ fn writePhaseJson(w: *std.io.Writer, s: PhaseStats) !void {
     );
 }
 
-// ── TCP-transport benchmark ────────────────────────────────────────────
-//
 // Spins up a Server on 127.0.0.1:0 in a worker thread, connects a
 // Client, and drives the same deterministic workload as the in-process
 // path. Report shape is unchanged so JSON diffs across transports are
@@ -461,7 +474,6 @@ const TcpHarness = struct {
     store: Store,
     index: HnswIndexFn(M),
     md: MutableMetadata,
-    ws: HnswIndexFn(M).Workspace,
     srv: server_mod.Server(M),
     shutdown: std.atomic.Value(bool),
     thread: ?std.Thread,
@@ -481,25 +493,24 @@ const TcpHarness = struct {
             .seed = opts.seed,
         });
         self.md = MutableMetadata.init();
-        self.ws = try HnswIndexFn(M).Workspace.init(allocator, opts.num_vectors, opts.max_ef);
 
         self.srv = try server_mod.Server(M).init(
             allocator,
             &self.store,
             &self.index,
             &self.md,
-            &self.ws,
             null, // no embedder — benchmark uses *_VEC opcodes only
             &self.cfg,
             .{
                 .listen_addr = "127.0.0.1",
                 .listen_port = 0,
-                .max_connections = 4,
+                .max_connections = opts.tcp_max_connections,
                 .max_frame_bytes = protocol_mod.MAX_FRAME_BYTES_DEFAULT,
                 .idle_timeout_secs = 0,
                 .auto_snapshot_secs = 0,
                 .reuse_address = true,
                 .skip_final_snapshot = true,
+                .n_workers = opts.server_n_workers,
             },
         );
     }
@@ -513,11 +524,10 @@ const TcpHarness = struct {
     }
 
     fn tearDown(self: *TcpHarness) void {
-        self.shutdown.store(true, .monotonic);
+        self.srv.requestShutdown();
         if (self.thread) |t| t.join();
         self.thread = null;
         self.srv.deinit();
-        self.ws.deinit(self.allocator);
         self.md.deinit(self.allocator);
         self.index.deinit();
         self.store.deinit(self.allocator);
@@ -578,8 +588,6 @@ fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !voi
         }
     }
 
-    // ── build phase (client inserts) ────────────────────────────────
-
     var build_hist = try Histogram.init(allocator, INSERT_BUCKETS, INSERT_BUCKET_NS);
     defer build_hist.deinit();
 
@@ -592,8 +600,6 @@ fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !voi
     }
     const build_wall_ns = build_wall.read();
     const build_stats = phaseStatsFrom(&build_hist, build_wall_ns);
-
-    // ── recall (optional) via the server's own Store for brute force ──
 
     var truth_ids: ?[]u32 = null;
     defer if (truth_ids) |t| allocator.free(t);
@@ -610,12 +616,14 @@ fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !voi
         }
     }
 
-    // ── search phase (client searches) ──────────────────────────────
+    // `concurrent_clients` controls how many client connections drive
+    // the workload in parallel. 1 is the old sequential path. >1
+    // spawns N threads that pull query indices from an atomic counter,
+    // each with their own Client + Histogram + recall accumulator.
+    // Per-thread histograms merge at the end.
 
-    const got_ids = try allocator.alloc(u32, opts.top_k);
-    defer allocator.free(got_ids);
-
-    // warmup
+    // Warmup still uses the main-thread client so the threads don't
+    // race on a shared client during warmup.
     const warmup_n = @min(opts.warmup, opts.num_queries);
     for (0..warmup_n) |qi| {
         const q = query_buf[qi * opts.dim ..][0..opts.dim];
@@ -626,22 +634,114 @@ fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !voi
     var search_hist = try Histogram.init(allocator, SEARCH_BUCKETS, SEARCH_BUCKET_NS);
     defer search_hist.deinit();
 
-    var recall_sum: f64 = 0;
-    var search_wall = try std.time.Timer.start();
-    for (0..opts.num_queries) |qi| {
-        const q = query_buf[qi * opts.dim ..][0..opts.dim];
-        var op = try std.time.Timer.start();
-        const results = try client.searchVec(q, @intCast(opts.top_k), @intCast(opts.ef_search));
-        search_hist.record(op.read());
-        defer client.freeSearchResults(results);
+    const n_clients = @max(@as(usize, 1), opts.concurrent_clients);
 
-        if (truth_ids) |truth| {
-            for (results, 0..) |r, i| got_ids[i] = r.id;
-            const this_truth = truth[qi * opts.top_k .. (qi + 1) * opts.top_k];
-            recall_sum += bruteforce.computeRecall(this_truth, got_ids[0..results.len]);
+    const SearchDriver = struct {
+        allocator: std.mem.Allocator,
+        addr: std.net.Address,
+        query_buf: []f32,
+        dim: usize,
+        top_k: usize,
+        ef_search: usize,
+        num_queries: usize,
+        cursor: std.atomic.Value(usize),
+        validate: bool,
+        truth_ids: ?[]u32,
+
+        // Aggregated across threads.
+        merge_mutex: std.Thread.Mutex = .{},
+        merged_hist: *Histogram,
+        merged_recall_sum: f64 = 0,
+        first_err: ?anyerror = null,
+    };
+
+    var driver: SearchDriver = .{
+        .allocator = allocator,
+        .addr = try std.net.Address.parseIp("127.0.0.1", h.srv.bound_port),
+        .query_buf = query_buf,
+        .dim = opts.dim,
+        .top_k = opts.top_k,
+        .ef_search = opts.ef_search,
+        .num_queries = opts.num_queries,
+        .cursor = .init(0),
+        .validate = opts.validate,
+        .truth_ids = truth_ids,
+        .merged_hist = &search_hist,
+    };
+
+    const WorkerFn = struct {
+        fn run(d: *SearchDriver) void {
+            var local_hist = Histogram.init(d.allocator, SEARCH_BUCKETS, SEARCH_BUCKET_NS) catch |e| {
+                d.merge_mutex.lock();
+                if (d.first_err == null) d.first_err = e;
+                d.merge_mutex.unlock();
+                return;
+            };
+            defer local_hist.deinit();
+
+            var c = client_mod.Client.connect(d.allocator, d.addr, .{
+                .recv_buf_size = 4 * 1024 * 1024,
+                .send_buf_size = 4 * 1024 * 1024,
+            }) catch |e| {
+                d.merge_mutex.lock();
+                if (d.first_err == null) d.first_err = e;
+                d.merge_mutex.unlock();
+                return;
+            };
+            defer c.deinit();
+
+            const got_ids_local = d.allocator.alloc(u32, d.top_k) catch |e| {
+                d.merge_mutex.lock();
+                if (d.first_err == null) d.first_err = e;
+                d.merge_mutex.unlock();
+                return;
+            };
+            defer d.allocator.free(got_ids_local);
+
+            var local_recall: f64 = 0;
+
+            while (true) {
+                const qi = d.cursor.fetchAdd(1, .monotonic);
+                if (qi >= d.num_queries) break;
+
+                const q = d.query_buf[qi * d.dim ..][0..d.dim];
+                var op = std.time.Timer.start() catch unreachable;
+                const results = c.searchVec(q, @intCast(d.top_k), @intCast(d.ef_search)) catch |e| {
+                    d.merge_mutex.lock();
+                    if (d.first_err == null) d.first_err = e;
+                    d.merge_mutex.unlock();
+                    return;
+                };
+                local_hist.record(op.read());
+
+                if (d.truth_ids) |truth| {
+                    for (results, 0..) |r, i| got_ids_local[i] = r.id;
+                    const this_truth = truth[qi * d.top_k .. (qi + 1) * d.top_k];
+                    local_recall += bruteforce.computeRecall(this_truth, got_ids_local[0..results.len]);
+                }
+                c.freeSearchResults(results);
+            }
+
+            d.merge_mutex.lock();
+            defer d.merge_mutex.unlock();
+            d.merged_hist.merge(&local_hist);
+            d.merged_recall_sum += local_recall;
         }
+    };
+
+    var search_wall = try std.time.Timer.start();
+
+    const threads = try allocator.alloc(std.Thread, n_clients);
+    defer allocator.free(threads);
+    for (threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, WorkerFn.run, .{&driver});
     }
+    for (threads) |t| t.join();
+
     const search_wall_ns = search_wall.read();
+    if (driver.first_err) |e| return e;
+
+    const recall_sum = driver.merged_recall_sum;
     const search_stats = phaseStatsFrom(&search_hist, search_wall_ns);
 
     const recall: ?f32 = if (opts.validate)
@@ -662,8 +762,6 @@ fn runTcp(allocator: std.mem.Allocator, opts: Options, out: *std.io.Writer) !voi
     try out.flush();
 }
 
-// ── protocol-floor micro-benchmark ────────────────────────────────────
-//
 // Two phases, both reported with the same PhaseStats shape:
 //   1. PING RTT  — bounds the protocol floor (syscalls + framing).
 //   2. SEARCH_VEC RTT with 1 stored vector — bounds floor + minimal
@@ -707,8 +805,6 @@ fn runProtocolFloor(allocator: std.mem.Allocator, opts: Options, out: *std.io.Wr
     var k: usize = 0;
     while (k < opts.warmup) : (k += 1) try client.ping();
 
-    // ── PING RTT ───────────────────────────────────────────────────
-
     var ping_hist = try Histogram.init(allocator, SEARCH_BUCKETS, SEARCH_BUCKET_NS);
     defer ping_hist.deinit();
     var ping_wall = try std.time.Timer.start();
@@ -720,8 +816,6 @@ fn runProtocolFloor(allocator: std.mem.Allocator, opts: Options, out: *std.io.Wr
     }
     const ping_wall_ns = ping_wall.read();
     const ping_stats = phaseStatsFrom(&ping_hist, ping_wall_ns);
-
-    // ── SEARCH_VEC RTT ─────────────────────────────────────────────
 
     var search_hist = try Histogram.init(allocator, SEARCH_BUCKETS, SEARCH_BUCKET_NS);
     defer search_hist.deinit();
@@ -760,8 +854,6 @@ fn runProtocolFloor(allocator: std.mem.Allocator, opts: Options, out: *std.io.Wr
     }
     try out.flush();
 }
-
-// ── tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
