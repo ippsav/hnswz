@@ -1,12 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-// a [1, 2, 3 ]
-// b [4, 5, 6 ]
-//
-// res = (1 * 4) + (2 * 5) + (3 * 6) = 32
-
-const VecLen = 4;
+const VecLen = std.simd.suggestVectorLength(f32) orelse 4;
 const Vec4 = @Vector(VecLen, f32);
 
 pub fn dot(a: []const f32, b: []const f32) f32 {
