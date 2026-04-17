@@ -52,6 +52,18 @@ pub const Store = struct {
         return self.deleted.isSet(id);
     }
 
+    /// Return the id the next `add` call would assign, without mutating
+    /// anything. Used by the WAL to record the id it is about to allocate
+    /// before the vector data is actually stored. Matches `add`'s LIFO
+    /// free-list policy so replay lands on the same ids.
+    pub fn peekNextId(self: *const Self) ?u32 {
+        if (self.live_count >= self.capacity) return null;
+        if (self.free_len > 0) {
+            return self.free_list[self.free_len - 1];
+        }
+        return @intCast(self.count);
+    }
+
     /// Append a vector. Reuses the most recently deleted slot if one is
     /// available, otherwise bumps `count`. Returns the assigned id.
     pub fn add(self: *Self, v: []const f32) !u32 {
@@ -115,27 +127,22 @@ pub const Store = struct {
         return self.data[id * self.dim ..][0..self.dim];
     }
 
-    /// old_to_new[old_id] = new dense id, or 0xFFFFFFFF for deleted slots.
-    /// Length equals `self.count`. Used by HnswIndex.save and metadata save
-    /// to rewrite id references when persisting a compacted snapshot.
-    pub fn buildRemap(self: *const Self, allocator: std.mem.Allocator) ![]u32 {
-        const remap = try allocator.alloc(u32, self.count);
-        var new_id: u32 = 0;
-        for (0..self.count) |i| {
-            const oid: u32 = @intCast(i);
-            if (self.deleted.isSet(oid)) {
-                remap[i] = 0xFFFFFFFF;
-            } else {
-                remap[i] = new_id;
-                new_id += 1;
-            }
-        }
-        return remap;
-    }
-
-    /// Persist vectors to disk in dense (compacted) order.
-    /// Format: "HVSF" | version u32 | dim u32 | count u64 | raw f32 bytes
-    /// The on-disk `count` is the live count; deleted slots are skipped.
+    /// Persist vectors to disk, preserving the full sparse layout.
+    ///
+    /// Format (HVSF v2):
+    ///   magic       [4]u8  "HVSF"
+    ///   version     u32    = 2
+    ///   dim         u32
+    ///   count       u64    high-water slot count (incl. tombstones)
+    ///   live_count  u64    non-deleted count
+    ///   bitmask     ceil(count/8) bytes, LSB-first per byte (bit set = deleted)
+    ///   vectors     count * dim * 4 bytes (tombstone slot bytes are stale
+    ///               and must never be dereferenced — the bitmask is the
+    ///               source of truth)
+    ///
+    /// Sparse on purpose: the live in-memory state is never re-compacted
+    /// after a snapshot, so matching layouts keeps WAL ids and in-memory
+    /// ids in one id space across snapshot/replay boundaries.
     pub fn save(self: *const Self, dir: std.fs.Dir, sub_path: []const u8) !void {
         const file = try dir.createFile(sub_path, .{});
         defer file.close();
@@ -144,29 +151,33 @@ pub const Store = struct {
         var bw = file.writer(&wbuf);
         const w = &bw.interface;
 
-        var hdr: [20]u8 = undefined;
+        var hdr: [28]u8 = undefined;
         @memcpy(hdr[0..4], "HVSF");
-        std.mem.writeInt(u32, hdr[4..8], 1, .little);
+        std.mem.writeInt(u32, hdr[4..8], 2, .little);
         std.mem.writeInt(u32, hdr[8..12], @intCast(self.dim), .little);
-        std.mem.writeInt(u64, hdr[12..20], @intCast(self.live_count), .little);
+        std.mem.writeInt(u64, hdr[12..20], @intCast(self.count), .little);
+        std.mem.writeInt(u64, hdr[20..28], @intCast(self.live_count), .little);
         try w.writeAll(&hdr);
 
-        if (self.live_count == self.count) {
-            try w.writeAll(std.mem.sliceAsBytes(self.data[0 .. self.count * self.dim]));
-        } else {
-            for (0..self.count) |i| {
-                const id: u32 = @intCast(i);
-                if (self.deleted.isSet(id)) continue;
-                try w.writeAll(std.mem.sliceAsBytes(self.data[id * self.dim ..][0..self.dim]));
+        var byte: u8 = 0;
+        for (0..self.count) |i| {
+            if (self.deleted.isSet(@intCast(i))) byte |= @as(u8, 1) << @intCast(i % 8);
+            if (i % 8 == 7) {
+                try w.writeByte(byte);
+                byte = 0;
             }
         }
+        if (self.count % 8 != 0) try w.writeByte(byte);
+
+        try w.writeAll(std.mem.sliceAsBytes(self.data[0 .. self.count * self.dim]));
+
         try w.flush();
+        try file.sync();
     }
 
     /// Load vectors from disk. Caller owns the returned store.
-    /// Allocates exactly `count * dim` f32 (no slack capacity) unless
-    /// `cap_override` is non-null, in which case the store has `cap_override`
-    /// capacity and `count` filled entries.
+    /// `cap_override` sizes the store's capacity; must be >= file's count.
+    /// When null, capacity equals count (no growth room).
     pub fn load(
         allocator: std.mem.Allocator,
         dir: std.fs.Dir,
@@ -180,16 +191,18 @@ pub const Store = struct {
         var br = file.readerStreaming(&rbuf);
         const r = &br.interface;
 
-        var hdr: [20]u8 = undefined;
+        var hdr: [28]u8 = undefined;
         try r.readSliceAll(&hdr);
 
         if (!std.mem.eql(u8, hdr[0..4], "HVSF")) return error.InvalidMagic;
 
         const version = std.mem.readInt(u32, hdr[4..8], .little);
-        if (version != 1) return error.UnsupportedVersion;
+        if (version != 2) return error.UnsupportedVersion;
 
         const file_dim: usize = @intCast(std.mem.readInt(u32, hdr[8..12], .little));
         const count: usize = @intCast(std.mem.readInt(u64, hdr[12..20], .little));
+        const live_count: usize = @intCast(std.mem.readInt(u64, hdr[20..28], .little));
+        if (live_count > count) return error.InvalidFile;
 
         const cap = cap_override orelse count;
         if (cap < count) return error.CapacityTooSmall;
@@ -197,9 +210,29 @@ pub const Store = struct {
         var store = try Self.init(allocator, file_dim, cap);
         errdefer store.deinit(allocator);
 
+        const bitmask_len = (count + 7) / 8;
+        var dead_seen: usize = 0;
+        var i: usize = 0;
+        while (i < bitmask_len) : (i += 1) {
+            var byte: [1]u8 = undefined;
+            try r.readSliceAll(&byte);
+            const base = i * 8;
+            var bit: usize = 0;
+            while (bit < 8 and base + bit < count) : (bit += 1) {
+                if ((byte[0] >> @intCast(bit)) & 1 == 1) {
+                    const id: u32 = @intCast(base + bit);
+                    store.deleted.set(id);
+                    store.free_list[store.free_len] = id;
+                    store.free_len += 1;
+                    dead_seen += 1;
+                }
+            }
+        }
+        if (dead_seen + live_count != count) return error.InvalidFile;
+
         try r.readSliceAll(std.mem.sliceAsBytes(store.data[0 .. count * file_dim]));
         store.count = count;
-        store.live_count = count;
+        store.live_count = live_count;
 
         return store;
     }
@@ -385,7 +418,7 @@ test "load with cap_override preserves growth room" {
     try testing.expectEqual(@as(usize, 100), loaded.capacity);
 }
 
-test "save compacts over deleted slots" {
+test "save preserves tombstones and ids in sparse layout" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -403,29 +436,44 @@ test "save compacts over deleted slots" {
     var loaded = try Store.load(testing.allocator, tmp.dir, "v.hvsf", null);
     defer loaded.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 2), loaded.count);
+    try testing.expectEqual(@as(usize, 4), loaded.count);
     try testing.expectEqual(@as(usize, 2), loaded.live_count);
+    try testing.expect(!loaded.isDeleted(0));
+    try testing.expect(loaded.isDeleted(1));
+    try testing.expect(loaded.isDeleted(2));
+    try testing.expect(!loaded.isDeleted(3));
     try testing.expectEqualSlices(f32, &.{ 1.0, 1.0 }, loaded.get(0));
-    try testing.expectEqualSlices(f32, &.{ 4.0, 4.0 }, loaded.get(1));
+    try testing.expectEqualSlices(f32, &.{ 4.0, 4.0 }, loaded.get(3));
+    try testing.expectEqual(@as(usize, 2), loaded.free_len);
 }
 
-test "buildRemap maps live ids densely and sentinels deleted ones" {
-    var store = try Store.init(testing.allocator, 1, 5);
-    defer store.deinit(testing.allocator);
+test "load reconstructs free list so addAt and peekNextId work" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
+    var store = try Store.init(testing.allocator, 1, 4);
+    defer store.deinit(testing.allocator);
     _ = try store.add(&[_]f32{1.0});
     _ = try store.add(&[_]f32{2.0});
     _ = try store.add(&[_]f32{3.0});
-    _ = try store.add(&[_]f32{4.0});
+    store.delete(0);
+    store.delete(2);
+    try store.save(tmp.dir, "v.hvsf");
 
-    store.delete(1);
-    store.delete(3);
+    var loaded = try Store.load(testing.allocator, tmp.dir, "v.hvsf", 4);
+    defer loaded.deinit(testing.allocator);
 
-    const remap = try store.buildRemap(testing.allocator);
-    defer testing.allocator.free(remap);
+    try testing.expectEqual(@as(usize, 3), loaded.count);
+    try testing.expectEqual(@as(usize, 1), loaded.live_count);
+    try testing.expectEqual(@as(usize, 2), loaded.free_len);
 
-    try testing.expectEqual(@as(u32, 0), remap[0]);
-    try testing.expectEqual(@as(u32, 0xFFFFFFFF), remap[1]);
-    try testing.expectEqual(@as(u32, 1), remap[2]);
-    try testing.expectEqual(@as(u32, 0xFFFFFFFF), remap[3]);
+    // peekNextId picks any freed id (LIFO from reconstructed list).
+    const next = loaded.peekNextId().?;
+    try testing.expect(next == 0 or next == 2);
+
+    // addAt into the specific other tombstone still works.
+    const other: u32 = if (next == 0) 2 else 0;
+    try loaded.addAt(other, &[_]f32{9.0});
+    try testing.expect(!loaded.isDeleted(other));
+    try testing.expectEqual(@as(usize, 2), loaded.live_count);
 }

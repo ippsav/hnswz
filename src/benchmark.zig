@@ -499,6 +499,7 @@ const TcpHarness = struct {
             &self.store,
             &self.index,
             &self.md,
+            null, // WAL disabled — benchmark is in-process, no durability needed
             null, // no embedder — benchmark uses *_VEC opcodes only
             &self.cfg,
             .{

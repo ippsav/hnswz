@@ -110,6 +110,31 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, sourc
     var data_dir = try std.fs.cwd().openDir(cfg.storage.data_dir, .{});
     defer data_dir.close();
 
+    // Refuse to run concurrently with another hnswz process touching the
+    // same data_dir. flock(2)-based advisory lock; released on process
+    // exit (incl. kill -9) so a stale file never strands the dir.
+    var lock = hnswz.lockfile.LockFile.acquire(data_dir, cfg.storage.lock_file) catch |err| switch (err) {
+        error.AlreadyLocked => {
+            log.err("data_dir '{s}' is already locked by another hnswz process", .{cfg.storage.data_dir});
+            std.process.exit(1);
+        },
+        else => {
+            log.err("cannot acquire lock on '{s}/{s}': {s}", .{ cfg.storage.data_dir, cfg.storage.lock_file, @errorName(err) });
+            std.process.exit(1);
+        },
+    };
+    defer lock.release();
+
+    // `build` produces a fresh snapshot from scratch. If a stale WAL
+    // exists from a previous `serve` session, drop it — its records
+    // reference the old (possibly incompatible) vectors.
+    data_dir.deleteFile(cfg.storage.wal_file) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            log.warn("could not delete stale WAL '{s}/{s}': {s}", .{ cfg.storage.data_dir, cfg.storage.wal_file, @errorName(err) });
+        },
+    };
+
     // Collect & sort filenames.
     var filenames: std.ArrayList([]u8) = .{};
     defer {
@@ -181,8 +206,12 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, sourc
     std.debug.print("\n", .{});
 
     try store.save(data_dir, cfg.storage.vectors_file);
-    try index.save(data_dir, cfg.storage.graph_file, null);
-    try hnswz.metadata.save(data_dir, cfg.storage.metadata_file, filenames.items);
+    try index.save(data_dir, cfg.storage.graph_file);
+
+    const slots = try allocator.alloc(?[]const u8, filenames.items.len);
+    defer allocator.free(slots);
+    for (filenames.items, 0..) |name, i| slots[i] = name;
+    try hnswz.metadata.save(data_dir, cfg.storage.metadata_file, slots, filenames.items.len);
 
     log.info("index built: {d} vectors saved to {s}", .{ n, cfg.storage.data_dir });
 }
@@ -198,6 +227,21 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
         std.process.exit(1);
     };
     defer data_dir.close();
+
+    // Query holds the lock for its entire lifetime — the REPL needs
+    // a point-in-time view and a concurrent `serve` writing under us
+    // would break that.
+    var lock = hnswz.lockfile.LockFile.acquire(data_dir, cfg.storage.lock_file) catch |err| switch (err) {
+        error.AlreadyLocked => {
+            log.err("data_dir '{s}' is already locked by another hnswz process", .{cfg.storage.data_dir});
+            std.process.exit(1);
+        },
+        else => {
+            log.err("cannot acquire lock on '{s}/{s}': {s}", .{ cfg.storage.data_dir, cfg.storage.lock_file, @errorName(err) });
+            std.process.exit(1);
+        },
+    };
+    defer lock.release();
 
     var store = hnswz.Store.load(allocator, data_dir, cfg.storage.vectors_file, cfg.storage.max_vectors) catch |err| {
         log.err("cannot load vectors file '{s}/{s}': {s}", .{
@@ -234,17 +278,61 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
     };
     defer index.deinit();
 
-    var md = hnswz.metadata.load(allocator, data_dir, cfg.storage.metadata_file) catch |err| {
-        log.err("cannot load metadata file '{s}/{s}': {s}", .{
-            cfg.storage.data_dir, cfg.storage.metadata_file, @errorName(err),
-        });
-        std.process.exit(1);
-    };
+    // Use a MutableMetadata so we can layer in WAL replay results on
+    // top of whatever was in the static sidecar.
+    var md = hnswz.metadata_mut.MutableMetadata.init();
     defer md.deinit(allocator);
+    try md.ensureCapacity(allocator, cfg.storage.max_vectors);
+    {
+        var static_md = hnswz.metadata.load(allocator, data_dir, cfg.storage.metadata_file) catch |err| {
+            log.err("cannot load metadata file '{s}/{s}': {s}", .{
+                cfg.storage.data_dir, cfg.storage.metadata_file, @errorName(err),
+            });
+            std.process.exit(1);
+        };
+        defer static_md.deinit(allocator);
 
-    if (md.count != store.live_count) {
-        log.err("metadata count ({d}) != vectors count ({d})", .{ md.count, store.live_count });
-        std.process.exit(1);
+        if (static_md.count != store.count or static_md.live_count != store.live_count) {
+            log.err(
+                "metadata slots ({d}/{d}) != vectors slots ({d}/{d})",
+                .{ static_md.live_count, static_md.count, store.live_count, store.count },
+            );
+            std.process.exit(1);
+        }
+        for (0..static_md.count) |i| {
+            const id: u32 = @intCast(i);
+            if (static_md.isTombstone(id)) continue;
+            try md.setAt(allocator, id, static_md.get(id));
+        }
+    }
+
+    // Replay any WAL records that post-date the snapshot. This lets
+    // `hnswz query` see writes made by a previous `serve` session that
+    // crashed before snapshotting.
+    {
+        var res = hnswz.wal.Wal.open(
+            allocator,
+            data_dir,
+            cfg.storage.wal_file,
+            @intCast(cfg.embedder.dim),
+            &store,
+            &index,
+            &md,
+        ) catch |err| switch (err) {
+            error.DimMismatch => {
+                log.err("WAL dim mismatch — config.embedder.dim changed since last run?", .{});
+                std.process.exit(1);
+            },
+            else => {
+                log.err("cannot open WAL '{s}/{s}': {s}", .{ cfg.storage.data_dir, cfg.storage.wal_file, @errorName(err) });
+                std.process.exit(1);
+            },
+        };
+        defer res.wal.close();
+        if (res.replayed > 0) log.info("replayed {d} WAL record(s){s}", .{
+            res.replayed,
+            if (res.truncated) " (truncated at corruption)" else "",
+        });
     }
 
     log.info("index loaded: {d} vectors, dim={d}, upper_slots={d}/{d}", .{
@@ -327,7 +415,7 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
         };
 
         for (results) |r| {
-            try out.print("{s}\t{d:.6}\n", .{ md.get(r.id), r.dist });
+            try out.print("{s}\t{d:.6}\n", .{ md.get(r.id) orelse "", r.dist });
         }
         try out.flush();
     }
@@ -368,6 +456,20 @@ fn runServe(
     };
     var data_dir = try std.fs.cwd().openDir(cfg.storage.data_dir, .{});
     defer data_dir.close();
+
+    // Hold the lock for the server's lifetime so a second `serve` or
+    // concurrent `build` / `query` can't corrupt state under us.
+    var lock = hnswz.lockfile.LockFile.acquire(data_dir, cfg.storage.lock_file) catch |err| switch (err) {
+        error.AlreadyLocked => {
+            log.err("data_dir '{s}' is already locked by another hnswz process", .{cfg.storage.data_dir});
+            std.process.exit(1);
+        },
+        else => {
+            log.err("cannot acquire lock on '{s}/{s}': {s}", .{ cfg.storage.data_dir, cfg.storage.lock_file, @errorName(err) });
+            std.process.exit(1);
+        },
+    };
+    defer lock.release();
 
     // Try to load existing store+graph+metadata. If the files are absent
     // we start with a fresh empty index sized from config.
@@ -421,18 +523,59 @@ fn runServe(
         if (data_dir.access(cfg.storage.metadata_file, .{})) |_| {
             var static_md = try hnswz.metadata.load(allocator, data_dir, cfg.storage.metadata_file);
             defer static_md.deinit(allocator);
-            if (static_md.count != store.live_count) {
-                log.err("metadata count ({d}) != vectors count ({d})", .{ static_md.count, store.live_count });
+            if (static_md.count != store.count or static_md.live_count != store.live_count) {
+                log.err(
+                    "metadata slots ({d}/{d}) != vectors slots ({d}/{d})",
+                    .{ static_md.live_count, static_md.count, store.live_count, store.count },
+                );
                 std.process.exit(1);
             }
             for (0..static_md.count) |i| {
-                try mm.setAt(allocator, @intCast(i), static_md.get(@intCast(i)));
+                const id: u32 = @intCast(i);
+                if (static_md.isTombstone(id)) continue;
+                try mm.setAt(allocator, id, static_md.get(id));
             }
         } else |_| {}
     }
 
     // Workspaces are owned by the dispatcher's worker pool now — no
     // server-side Workspace allocation here.
+
+    // Open the WAL and replay any records that post-date the snapshot
+    // we just loaded. Mutating handlers in the dispatcher will append +
+    // fsync to this file for each ack'd write.
+    var wal_handle: ?hnswz.wal.Wal = null;
+    defer if (wal_handle) |*w| w.close();
+    if (cfg.storage.wal_enabled) {
+        const res = hnswz.wal.Wal.open(
+            allocator,
+            data_dir,
+            cfg.storage.wal_file,
+            @intCast(cfg.embedder.dim),
+            &store,
+            &index,
+            &mm,
+        ) catch |err| switch (err) {
+            error.DimMismatch => {
+                log.err("WAL dim mismatch — config.embedder.dim changed since last run?", .{});
+                std.process.exit(1);
+            },
+            error.CorruptHeader => {
+                log.err("WAL header is corrupt; delete '{s}/{s}' if you intend to discard uncommitted writes", .{ cfg.storage.data_dir, cfg.storage.wal_file });
+                std.process.exit(1);
+            },
+            else => {
+                log.err("cannot open WAL '{s}/{s}': {s}", .{ cfg.storage.data_dir, cfg.storage.wal_file, @errorName(err) });
+                std.process.exit(1);
+            },
+        };
+        if (res.replayed > 0) log.info("replayed {d} WAL record(s){s}", .{
+            res.replayed,
+            if (res.truncated) " (truncated at corruption)" else "",
+        });
+        wal_handle = res.wal;
+    }
+    const wal_ptr: ?*hnswz.wal.Wal = if (wal_handle != null) &wal_handle.? else null;
 
     // Embedder: Ollama if configured. Text opcodes fail cleanly otherwise.
     var maybe_client: ?hnswz.OllamaClient = null;
@@ -459,7 +602,7 @@ fn runServe(
         .n_workers = args.serve_n_workers orelse 0,
     };
 
-    var server_inst = try Server.init(allocator, &store, &index, &mm, embedder, cfg, opts);
+    var server_inst = try Server.init(allocator, &store, &index, &mm, wal_ptr, embedder, cfg, opts);
     defer server_inst.deinit();
 
     var shutdown_flag: std.atomic.Value(bool) = .init(false);
@@ -1005,6 +1148,7 @@ const ClientTestCtx = struct {
             &self.store,
             &self.index,
             &self.md,
+            null, // test harness: WAL off
             self.embedder.embedder(),
             &self.cfg,
             .{
@@ -1268,4 +1412,153 @@ test "client verb: get returns name and vec" {
     const out = buf[0..w2.end];
     try testing.expect(std.mem.indexOf(u8, out, "name=") != null);
     try testing.expect(std.mem.indexOf(u8, out, "1") != null); // the vec contains 1.0
+}
+
+// End-to-end crash-recovery test: spin a server with a real WAL, send
+// writes, stop the server WITHOUT a final snapshot (simulating kill
+// -9), then spin a fresh server on the same data_dir and verify the
+// WAL replay brought all state back.
+test "WAL: crash recovery restores writes across restart" {
+    const dim: usize = 4;
+    const max_vectors: usize = 16;
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir_path);
+
+    const cfg: hnswz.config.Config = .{
+        .embedder = .{ .provider = "ollama", .base_url = "http://localhost:11434", .model = "fake", .dim = dim, .max_text_bytes = 1024 },
+        .index = .{ .ef_construction = 16, .ef_search = 16, .max_ef = 16 },
+        .storage = .{ .data_dir = data_dir_path, .max_vectors = max_vectors },
+    };
+
+    // --- phase 1: server A writes some vectors, then goes away ---
+    const first_id: u32, const second_id: u32 = blk: {
+        var store = try hnswz.Store.init(allocator, dim, max_vectors);
+        defer store.deinit(allocator);
+        var index = try hnswz.HnswIndex(M).init(allocator, &store, .{
+            .max_vectors = max_vectors,
+            .max_upper_slots = max_vectors,
+            .ef_construction = cfg.index.ef_construction,
+            .seed = cfg.index.seed,
+        });
+        defer index.deinit();
+        var md = hnswz.metadata_mut.MutableMetadata.init();
+        defer md.deinit(allocator);
+
+        var wal_res = try hnswz.wal.Wal.open(
+            allocator,
+            tmp.dir,
+            cfg.storage.wal_file,
+            @intCast(dim),
+            &store,
+            &index,
+            &md,
+        );
+        errdefer wal_res.wal.close();
+
+        var embedder = hnswz.FakeEmbedder.init(dim, 0xabc);
+        var srv = try hnswz.server.Server(M).init(
+            allocator,
+            &store,
+            &index,
+            &md,
+            &wal_res.wal,
+            embedder.embedder(),
+            &cfg,
+            .{
+                .listen_addr = "127.0.0.1",
+                .listen_port = 0,
+                .max_connections = 4,
+                .max_frame_bytes = 1 << 20,
+                .idle_timeout_secs = 0,
+                .auto_snapshot_secs = 0,
+                .reuse_address = true,
+                .skip_final_snapshot = true, // simulates crash: no snapshot on exit
+                .n_workers = 2,
+            },
+        );
+        defer srv.deinit();
+
+        var shutdown: std.atomic.Value(bool) = .init(false);
+        const Runner = struct {
+            fn run(s: *hnswz.server.Server(M), sd: *std.atomic.Value(bool)) !void {
+                try s.run(sd);
+            }
+        };
+        const thread = try std.Thread.spawn(.{}, Runner.run, .{ &srv, &shutdown });
+
+        var client = try connectClient(allocator, srv.bound_port);
+        defer client.deinit();
+
+        const vec1 = [_]f32{ 1.0, 0, 0, 0 };
+        const vec2 = [_]f32{ 0, 1.0, 0, 0 };
+        const id1 = try client.insertVec(&vec1);
+        const id2 = try client.insertVec(&vec2);
+
+        // Stop the server WITHOUT final snapshot. WAL should still be
+        // fully durable; in-memory state is about to be discarded.
+        srv.requestShutdown();
+        thread.join();
+        wal_res.wal.close();
+
+        break :blk .{ id1, id2 };
+    };
+
+    // --- phase 2: fresh server on the same data_dir, verify state ---
+    {
+        var store = try hnswz.Store.init(allocator, dim, max_vectors);
+        defer store.deinit(allocator);
+        var index = try hnswz.HnswIndex(M).init(allocator, &store, .{
+            .max_vectors = max_vectors,
+            .max_upper_slots = max_vectors,
+            .ef_construction = cfg.index.ef_construction,
+            .seed = cfg.index.seed,
+        });
+        defer index.deinit();
+        var md = hnswz.metadata_mut.MutableMetadata.init();
+        defer md.deinit(allocator);
+
+        var wal_res = try hnswz.wal.Wal.open(
+            allocator,
+            tmp.dir,
+            cfg.storage.wal_file,
+            @intCast(dim),
+            &store,
+            &index,
+            &md,
+        );
+        defer wal_res.wal.close();
+
+        try testing.expectEqual(@as(usize, 2), wal_res.replayed);
+        try testing.expectEqual(@as(usize, 2), store.live_count);
+        try testing.expect(!store.isDeleted(first_id));
+        try testing.expect(!store.isDeleted(second_id));
+
+        // Search should find the inserted vec at distance 0.
+        var ws = try hnswz.HnswIndex(M).Workspace.init(allocator, max_vectors, cfg.index.ef_search);
+        defer ws.deinit(allocator);
+        var out: [2]hnswz.heap.Entry = undefined;
+        const query = [_]f32{ 1.0, 0, 0, 0 };
+        const results = try index.search(&ws, &query, 1, cfg.index.ef_search, &out);
+        try testing.expectEqual(@as(usize, 1), results.len);
+        try testing.expectEqual(first_id, results[0].id);
+    }
+}
+
+test "lockfile: serve refuses to start if another holder is active" {
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var lock1 = try hnswz.lockfile.LockFile.acquire(tmp.dir, "hnswz.lock");
+    defer lock1.release();
+
+    const res = hnswz.lockfile.LockFile.acquire(tmp.dir, "hnswz.lock");
+    try testing.expectError(error.AlreadyLocked, res);
+
+    _ = allocator; // unused — keep parity with other tests
 }

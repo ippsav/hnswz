@@ -366,6 +366,7 @@ const ClientTestHarness = struct {
             &self.store,
             &self.index,
             &self.md,
+            null, // test harness: WAL off
             emb,
             &self.cfg,
             .{

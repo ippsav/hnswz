@@ -7,9 +7,9 @@
 //! assigned by the `Store` (LIFO free-list or bump counter) so we simply
 //! follow along; this module does not mint ids.
 //!
-//! On `save`, we accept a `remap[old_id] -> new_id | 0xFFFFFFFF` produced
-//! by `Store.buildRemap` and write a compacted HMTF V1 file that the
-//! existing `metadata.load` can read back without format changes.
+//! `save` writes a sparse HMTF v2 file whose layout matches the in-memory
+//! slot array 1:1 — tombstones are preserved so that file ids and
+//! in-memory ids stay in one id space across snapshot/restart boundaries.
 const std = @import("std");
 const metadata = @import("metadata.zig");
 
@@ -76,44 +76,39 @@ pub const MutableMetadata = struct {
         return self.slots.items.len;
     }
 
-    /// Write an HMTF V1 file compacted according to `remap`. `remap[i] ==
-    /// 0xFFFFFFFF` means old id `i` is deleted; otherwise `remap[i]` is
-    /// the new dense id. Slots are emitted in new-id order so the file
-    /// round-trips through the static `metadata.load` unchanged.
-    ///
-    /// The caller is expected to pass a remap built from the same Store
-    /// that drove the mutations — inconsistency is a programming error,
-    /// not a runtime one, and is caught by assertions.
+    /// Write an HMTF v2 file that mirrors this module's in-memory slots
+    /// 1:1. `total_slots` must equal `store.count` — callers pass it
+    /// explicitly so we can emit trailing tombstones for slots the store
+    /// allocated but that this module has never seen (the HNSW graph
+    /// stays in sync by id even when metadata is never assigned).
     pub fn save(
         self: *const Self,
         allocator: std.mem.Allocator,
         dir: std.fs.Dir,
         sub_path: []const u8,
-        remap: []const u32,
+        total_slots: usize,
     ) !void {
-        // Gather non-deleted slots into new-id order.
-        var names = try allocator.alloc([]const u8, self.live_count);
-        defer allocator.free(names);
+        std.debug.assert(total_slots >= self.slots.items.len);
+
+        var slots = try allocator.alloc(?[]const u8, total_slots);
+        defer allocator.free(slots);
 
         var live_seen: usize = 0;
-        for (remap, 0..) |new_id, old_id| {
-            if (new_id == 0xFFFFFFFF) continue;
-            std.debug.assert(new_id < self.live_count);
-            std.debug.assert(old_id < self.slots.items.len);
-            const slot = self.slots.items[old_id] orelse {
-                // store says this id is live but metadata has no entry.
-                // Emit an empty name; callers that care set a name on
-                // every insert.
-                names[new_id] = "";
-                live_seen += 1;
-                continue;
-            };
-            names[new_id] = slot;
-            live_seen += 1;
+        for (0..total_slots) |i| {
+            if (i < self.slots.items.len) {
+                if (self.slots.items[i]) |name| {
+                    slots[i] = name;
+                    live_seen += 1;
+                } else {
+                    slots[i] = null;
+                }
+            } else {
+                slots[i] = null;
+            }
         }
         std.debug.assert(live_seen == self.live_count);
 
-        try metadata.save(dir, sub_path, names);
+        try metadata.save(dir, sub_path, slots, self.live_count);
     }
 };
 
@@ -185,7 +180,7 @@ test "setAt then deleteAt then setAt again" {
     try testing.expectEqualStrings("second", md.get(0).?);
 }
 
-test "save compacts via remap and round-trips through metadata.load" {
+test "save preserves ids and tombstones sparsely" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -198,18 +193,42 @@ test "save compacts via remap and round-trips through metadata.load" {
     try md.setAt(testing.allocator, 3, "d.txt"); // live
     md.deleteAt(testing.allocator, 1);
 
-    // Simulates Store.buildRemap with id 1 deleted:
-    //   old 0 -> new 0, old 1 -> deleted, old 2 -> new 1, old 3 -> new 2
-    const remap = [_]u32{ 0, 0xFFFFFFFF, 1, 2 };
-    try md.save(testing.allocator, tmp.dir, "m.hmtf", &remap);
+    try md.save(testing.allocator, tmp.dir, "m.hmtf", 4);
 
     var loaded = try metadata.load(testing.allocator, tmp.dir, "m.hmtf");
     defer loaded.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 3), loaded.count);
+    try testing.expectEqual(@as(usize, 4), loaded.count);
+    try testing.expectEqual(@as(usize, 3), loaded.live_count);
+    try testing.expect(!loaded.isTombstone(0));
+    try testing.expect(loaded.isTombstone(1));
+    try testing.expect(!loaded.isTombstone(2));
+    try testing.expect(!loaded.isTombstone(3));
     try testing.expectEqualStrings("a.txt", loaded.get(0));
-    try testing.expectEqualStrings("c.txt", loaded.get(1));
-    try testing.expectEqualStrings("d.txt", loaded.get(2));
+    try testing.expectEqualStrings("c.txt", loaded.get(2));
+    try testing.expectEqualStrings("d.txt", loaded.get(3));
+}
+
+test "save pads trailing tombstones when total_slots > slots.len" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var md = MutableMetadata.init();
+    defer md.deinit(testing.allocator);
+
+    try md.setAt(testing.allocator, 0, "a.txt");
+    // Store may have allocated id 1 without ever calling setAt (e.g. the
+    // server writes the WAL record and inserts before setAt). Save still
+    // has to keep slot 1 present as a tombstone so the graph's id 1 lines
+    // up with the file.
+    try md.save(testing.allocator, tmp.dir, "m.hmtf", 2);
+
+    var loaded = try metadata.load(testing.allocator, tmp.dir, "m.hmtf");
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), loaded.count);
+    try testing.expectEqual(@as(usize, 1), loaded.live_count);
+    try testing.expect(!loaded.isTombstone(0));
+    try testing.expect(loaded.isTombstone(1));
 }
 
 test "save with empty store writes empty file that round-trips" {
@@ -219,8 +238,7 @@ test "save with empty store writes empty file that round-trips" {
     var md = MutableMetadata.init();
     defer md.deinit(testing.allocator);
 
-    const remap: []const u32 = &.{};
-    try md.save(testing.allocator, tmp.dir, "empty.hmtf", remap);
+    try md.save(testing.allocator, tmp.dir, "empty.hmtf", 0);
 
     var loaded = try metadata.load(testing.allocator, tmp.dir, "empty.hmtf");
     defer loaded.deinit(testing.allocator);

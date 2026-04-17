@@ -35,6 +35,17 @@ pub const Storage = struct {
     vectors_file: []const u8 = "vectors.hvsf",
     graph_file: []const u8 = "graph.hgrf",
     metadata_file: []const u8 = "metadata.hmtf",
+    /// Write-Ahead Log filename inside `data_dir`. The WAL is append-only
+    /// and fsync'd on every mutation so acknowledged writes survive a
+    /// crash between snapshots.
+    wal_file: []const u8 = "wal.hwal",
+    /// Lock filename inside `data_dir`. `hnswz serve`, `build`, and `query`
+    /// all acquire an exclusive advisory lock on this file so two
+    /// processes can't concurrently mutate the same data directory.
+    lock_file: []const u8 = "hnswz.lock",
+    /// Disable the WAL (for tests / benchmarks where durability is not
+    /// required). Defaults to ON — the normal server path always WALs.
+    wal_enabled: bool = true,
 };
 
 pub const LogLevel = enum {

@@ -229,6 +229,20 @@ pub fn HnswIndex(comptime M: usize) type {
             return capped;
         }
 
+        /// Draw the random level for the next `insertWithLevel` call,
+        /// advancing the RNG by exactly one step. Split from `insert` so
+        /// callers that need to record the level in an external log (WAL)
+        /// can commit it durably before applying the insert.
+        pub fn drawLevel(self: *Self) u8 {
+            return self.randomLevel();
+        }
+
+        /// Hard cap for a replayed / WAL-supplied level. Exposed so callers
+        /// validating external input don't duplicate the comptime constant.
+        pub inline fn maxLevel() u8 {
+            return MAX_LEVEL;
+        }
+
         fn greedyClosest(self: *const Self, query: []const f32, entry_id: u32, layer_i: usize) u32 {
             var current = entry_id;
             var current_dist = self.distanceTo(current, query);
@@ -443,15 +457,23 @@ pub fn HnswIndex(comptime M: usize) type {
         }
 
         pub fn insert(self: *Self, ws: *Workspace, id: u32) !void {
+            const level = self.randomLevel();
+            return self.insertWithLevel(ws, id, level);
+        }
+
+        /// Same as `insert` but with the caller supplying the level. Used
+        /// by WAL replay so graph topology is byte-for-byte identical to
+        /// the original run even though the RNG has been reset. The live
+        /// path also uses this indirectly via `insert`.
+        pub fn insertWithLevel(self: *Self, ws: *Workspace, id: u32, level: u8) !void {
             if (@as(usize, id) >= self.max_vectors) return error.IndexFull;
+            if (level > MAX_LEVEL) return error.InvalidLevel;
 
             const is_new_slot = @as(usize, id) >= self.node_count;
             if (is_new_slot) {
                 std.debug.assert(@as(usize, id) == self.node_count);
                 self.node_count = @as(usize, id) + 1;
             }
-
-            const level = self.randomLevel();
 
             const upper_base: u32 = if (level == 0) 0 else blk: {
                 if (self.free_upper_runs[level].pop()) |reused| break :blk reused;
@@ -560,9 +582,16 @@ pub fn HnswIndex(comptime M: usize) type {
         /// to `delete(id) + add(v)` but guaranteed to return the same id so
         /// external id -> metadata mappings stay intact.
         pub fn replaceVector(self: *Self, ws: *Workspace, id: u32, v: []const f32) !void {
+            const level = self.randomLevel();
+            return self.replaceVectorWithLevel(ws, id, v, level);
+        }
+
+        /// Replace variant with a caller-supplied new level, used by WAL
+        /// replay to reproduce the exact topology of the original run.
+        pub fn replaceVectorWithLevel(self: *Self, ws: *Workspace, id: u32, v: []const f32, level: u8) !void {
             try self.delete(ws, id);
             try self.store.addAt(id, v);
-            try self.insert(ws, id);
+            try self.insertWithLevel(ws, id, level);
         }
 
         /// Top-k search. Writes results into `out` and returns the populated slice.
@@ -594,19 +623,31 @@ pub fn HnswIndex(comptime M: usize) type {
             return out[0..actual_k];
         }
 
-        /// Format: "HGRF" | version u32 | M u32 | entry_point u32 | max_level u8
-        ///         | ef_construction u32 | node_count u32
-        ///         | per-node: level u8, per-layer: neighbor_count u16 + neighbor IDs u32…
+        /// Format (HGRF v2):
+        ///   magic          [4]u8  "HGRF"
+        ///   version        u32    = 2
+        ///   M              u32    (must match compile-time M on load)
+        ///   entry_point    u32    raw store id, or 0xFFFFFFFF = none
+        ///   max_level      u8
+        ///   ef_construction u32
+        ///   node_count     u32    == store.count (slot high-water mark)
+        ///   per slot in 0..node_count:
+        ///     level          u8
+        ///     per layer 0..level:
+        ///       nbr_count    u16
+        ///       neighbor_ids u32[nbr_count]
         ///
-        /// When `remap` is non-null, the file is written in compacted form:
-        /// deleted nodes are skipped and surviving ids are rewritten using
-        /// `remap[old_id]`. `remap` must come from `store.buildRemap`.
+        /// Tombstoned slots are emitted as `level=0` followed by one empty
+        /// layer (nbr_count=0), a 3-byte marker. The store's deleted bitset
+        /// is the authoritative tombstone source at load time; the graph
+        /// file just has to stay the right shape.
         pub fn save(
             self: *const Self,
             dir: std.fs.Dir,
             sub_path: []const u8,
-            remap: ?[]const u32,
         ) !void {
+            std.debug.assert(self.node_count == self.store.count);
+
             const file = try dir.createFile(sub_path, .{});
             defer file.close();
 
@@ -614,20 +655,16 @@ pub fn HnswIndex(comptime M: usize) type {
             var bw = file.writer(&wbuf);
             const w = &bw.interface;
 
-            const live_node_count: u32 = @intCast(self.store.live_count);
-            const ep_field: u32 = if (self.entry_point) |ep|
-                (if (remap) |r| r[ep] else ep)
-            else
-                0xFFFFFFFF;
+            const ep_field: u32 = self.entry_point orelse 0xFFFFFFFF;
 
             var hdr: [25]u8 = undefined;
             @memcpy(hdr[0..4], "HGRF");
-            std.mem.writeInt(u32, hdr[4..8], 1, .little);
+            std.mem.writeInt(u32, hdr[4..8], 2, .little);
             std.mem.writeInt(u32, hdr[8..12], @intCast(M), .little);
             std.mem.writeInt(u32, hdr[12..16], ep_field, .little);
             hdr[16] = self.max_level;
             std.mem.writeInt(u32, hdr[17..21], @intCast(self.ef_construction), .little);
-            std.mem.writeInt(u32, hdr[21..25], live_node_count, .little);
+            std.mem.writeInt(u32, hdr[21..25], @intCast(self.node_count), .little);
             try w.writeAll(&hdr);
 
             var tmp4: [4]u8 = undefined;
@@ -635,22 +672,26 @@ pub fn HnswIndex(comptime M: usize) type {
             var live_nbrs: [M0]u32 = undefined;
             for (0..self.node_count) |node_i| {
                 const id: u32 = @intCast(node_i);
-                if (self.store.isDeleted(id)) continue;
+                if (self.store.isDeleted(id)) {
+                    // Tombstone marker: level=0, one empty layer.
+                    try w.writeByte(0);
+                    std.mem.writeInt(u16, &tmp2, 0, .little);
+                    try w.writeAll(&tmp2);
+                    continue;
+                }
                 const level = self.levels[id];
                 try w.writeByte(level);
 
-                // Filter out any stale references to deleted ids. These can
-                // linger on asymmetric edges: node Z may reference deleted
-                // `id` even when Z isn't in id's own neighbor list, so
-                // repair never visits Z. Search handles this via the
-                // tombstone filter; save has to scrub so the compacted file
-                // never contains dangling ids.
+                // Filter stale references to deleted ids that can linger on
+                // asymmetric edges. Search handles this via the tombstone
+                // filter at runtime; save scrubs so the persisted file has
+                // no dangling refs.
                 for (0..@as(usize, level) + 1) |layer_i| {
                     const nbrs = self.neighborsOf(id, layer_i);
                     var lc: usize = 0;
                     for (nbrs) |neighbor_id| {
                         if (self.store.isDeleted(neighbor_id)) continue;
-                        live_nbrs[lc] = if (remap) |r| r[neighbor_id] else neighbor_id;
+                        live_nbrs[lc] = neighbor_id;
                         lc += 1;
                     }
                     std.mem.writeInt(u16, &tmp2, @intCast(lc), .little);
@@ -663,10 +704,13 @@ pub fn HnswIndex(comptime M: usize) type {
             }
 
             try w.flush();
+            try file.sync();
         }
 
         /// Scan a graph file and report the sizes needed to load it.
         /// Useful for sizing the `Params` passed to `load` exactly.
+        /// Tombstone slots contribute level=0 and no neighbors, so the
+        /// reported `upper_slots` is exactly the sum of live-slot levels.
         pub fn scanSize(dir: std.fs.Dir, sub_path: []const u8) !LoadSize {
             const file = try dir.openFile(sub_path, .{});
             defer file.close();
@@ -679,7 +723,7 @@ pub fn HnswIndex(comptime M: usize) type {
             try r.readSliceAll(&hdr);
             if (!std.mem.eql(u8, hdr[0..4], "HGRF")) return error.InvalidMagic;
             const version = std.mem.readInt(u32, hdr[4..8], .little);
-            if (version != 1) return error.UnsupportedVersion;
+            if (version != 2) return error.UnsupportedVersion;
             const file_m = std.mem.readInt(u32, hdr[8..12], .little);
             if (file_m != M) return error.MParameterMismatch;
             const node_count: usize = @intCast(std.mem.readInt(u32, hdr[21..25], .little));
@@ -702,6 +746,10 @@ pub fn HnswIndex(comptime M: usize) type {
             return .{ .node_count = node_count, .upper_slots = upper_slots };
         }
 
+        /// Load a sparse graph file. `store` must be loaded first — its
+        /// deleted bitset decides which slots are tombstones. Tombstoned
+        /// slot entries in the file are expected to be `(level=0, 1 empty
+        /// layer)` and consume no per-slot upper-pool capacity.
         pub fn load(
             allocator: std.mem.Allocator,
             store: *Store,
@@ -721,7 +769,7 @@ pub fn HnswIndex(comptime M: usize) type {
 
             if (!std.mem.eql(u8, hdr[0..4], "HGRF")) return error.InvalidMagic;
             const version = std.mem.readInt(u32, hdr[4..8], .little);
-            if (version != 1) return error.UnsupportedVersion;
+            if (version != 2) return error.UnsupportedVersion;
             const file_m = std.mem.readInt(u32, hdr[8..12], .little);
             if (file_m != M) return error.MParameterMismatch;
             const raw_ep = std.mem.readInt(u32, hdr[12..16], .little);
@@ -731,6 +779,7 @@ pub fn HnswIndex(comptime M: usize) type {
             const node_count: usize = @intCast(std.mem.readInt(u32, hdr[21..25], .little));
 
             if (node_count > params.max_vectors) return error.CapacityTooSmall;
+            if (node_count != store.count) return error.GraphStoreMismatch;
 
             // File's ef_construction wins over params.ef_construction if differ —
             // keeps round-trip save/load semantics identical.
@@ -747,6 +796,20 @@ pub fn HnswIndex(comptime M: usize) type {
                 const id: u32 = @intCast(node_i);
                 try r.readSliceAll(&tmp1);
                 const level = tmp1[0];
+
+                const is_tombstone = store.isDeleted(id);
+                if (is_tombstone) {
+                    // Tombstone: expect level=0 and one empty layer, then
+                    // move on without claiming upper-pool slots.
+                    if (level != 0) return error.CorruptRecord;
+                    self.levels[id] = 0;
+                    self.upper_count[id] = 0;
+                    self.upper_offset[id] = @intCast(self.upper_used);
+                    try r.readSliceAll(&tmp2);
+                    const nbr_count: usize = @intCast(std.mem.readInt(u16, &tmp2, .little));
+                    if (nbr_count != 0) return error.CorruptRecord;
+                    continue;
+                }
 
                 if (self.upper_used + level > params.max_upper_slots) return error.UpperPoolFull;
                 self.levels[id] = level;
@@ -980,7 +1043,7 @@ test "save/load round-trip preserves recall@10" {
     defer tmp.cleanup();
 
     try store.save(tmp.dir, "vectors.hvsf");
-    try idx.save(tmp.dir, "graph.hgrf", null);
+    try idx.save(tmp.dir, "graph.hgrf");
 
     var loaded_store = try Store.load(testing.allocator, tmp.dir, "vectors.hvsf", null);
     defer loaded_store.deinit(testing.allocator);
@@ -1167,7 +1230,7 @@ test "replaceVector updates in place and keeps id" {
     try testing.expectEqual(@as(u32, target_id), results[0].id);
 }
 
-test "save after deletions compacts and round-trips" {
+test "save after deletions preserves ids sparsely and round-trips" {
     const Index = HnswIndex(8);
     const dim = 8;
     const n = 100;
@@ -1196,36 +1259,34 @@ test "save after deletions compacts and round-trips" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const remap = try store.buildRemap(testing.allocator);
-    defer testing.allocator.free(remap);
-
     try store.save(tmp.dir, "vectors.hvsf");
-    try idx.save(tmp.dir, "graph.hgrf", remap);
+    try idx.save(tmp.dir, "graph.hgrf");
 
-    var loaded_store = try Store.load(testing.allocator, tmp.dir, "vectors.hvsf", null);
+    var loaded_store = try Store.load(testing.allocator, tmp.dir, "vectors.hvsf", n);
     defer loaded_store.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, n - to_delete.len), loaded_store.count);
+    try testing.expectEqual(@as(usize, n), loaded_store.count);
+    try testing.expectEqual(@as(usize, n - to_delete.len), loaded_store.live_count);
+    for (to_delete) |id| try testing.expect(loaded_store.isDeleted(id));
 
     const sz = try Index.scanSize(tmp.dir, "graph.hgrf");
-    try testing.expectEqual(@as(usize, n - to_delete.len), sz.node_count);
+    try testing.expectEqual(@as(usize, n), sz.node_count);
 
     var loaded_idx = try Index.load(testing.allocator, &loaded_store, tmp.dir, "graph.hgrf", .{
-        .max_vectors = sz.node_count,
+        .max_vectors = n,
         .max_upper_slots = sz.upper_slots,
         .ef_construction = 64,
         .seed = 0,
     });
     defer loaded_idx.deinit();
 
-    var loaded_ws = try Index.Workspace.init(testing.allocator, sz.node_count, 64);
+    var loaded_ws = try Index.Workspace.init(testing.allocator, n, 64);
     defer loaded_ws.deinit(testing.allocator);
 
-    // Sanity: every surviving-old-id's vector is retrievable via its new id.
+    // Every surviving id maps to the same bytes it had before save.
     for (0..n) |i| {
         if (store.isDeleted(@intCast(i))) continue;
         const old_vec = store.get(@intCast(i));
-        const new_id = remap[i];
-        const loaded_vec = loaded_store.get(new_id);
+        const loaded_vec = loaded_store.get(@intCast(i));
         try testing.expectEqualSlices(f32, old_vec, loaded_vec);
     }
 
@@ -1234,6 +1295,7 @@ test "save after deletions compacts and round-trips" {
     var out: [5]heap.Entry = undefined;
     const results = try loaded_idx.search(&loaded_ws, query, 5, 64, &out);
     try testing.expect(results.len > 0);
+    for (results) |r| try testing.expect(!loaded_store.isDeleted(r.id));
 }
 
 test "delete pushes upper slots onto free-run list" {

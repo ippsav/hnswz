@@ -37,6 +37,7 @@ const metadata = @import("metadata.zig");
 const io_mod = @import("io.zig");
 const IO = io_mod.IO;
 const dispatcher_mod = @import("dispatcher.zig");
+const wal_mod = @import("wal.zig");
 
 const log = std.log.scoped(.server);
 
@@ -181,6 +182,7 @@ pub fn Server(comptime M: usize) type {
             store: *Store,
             index: *Index,
             md: *MutableMetadata,
+            wal: ?*wal_mod.Wal,
             embedder: ?ollama.Embedder,
             cfg: *const config_mod.Config,
             opts: ServeOptions,
@@ -230,6 +232,7 @@ pub fn Server(comptime M: usize) type {
                 store,
                 index,
                 md,
+                wal,
                 embedder,
                 cfg,
                 .{
@@ -753,27 +756,13 @@ pub fn Server(comptime M: usize) type {
         }
 
         fn finalSnapshot(self: *Self) void {
-            // Workers have already stopped by the time we call this.
-            // No concurrency; just do the snapshot directly.
-            self.snapshotInline() catch |err| {
+            // Workers have joined; we're the sole mutator. Go through the
+            // same snapshot path as the live server (which also does the
+            // directory fsync and WAL truncate) so shutdown and explicit
+            // snapshots can never diverge.
+            self.dispatcher.snapshotNow() catch |err| {
                 log.err("final snapshot failed: {s}", .{@errorName(err)});
             };
-        }
-
-        fn snapshotInline(self: *Self) !void {
-            std.fs.cwd().makePath(self.cfg.storage.data_dir) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => return err,
-            };
-            var dir = try std.fs.cwd().openDir(self.cfg.storage.data_dir, .{});
-            defer dir.close();
-
-            const remap = try self.store.buildRemap(self.allocator);
-            defer self.allocator.free(remap);
-
-            try self.store.save(dir, self.cfg.storage.vectors_file);
-            try self.index.save(dir, self.cfg.storage.graph_file, remap);
-            try self.metadata.save(self.allocator, dir, self.cfg.storage.metadata_file, remap);
         }
     };
 }
@@ -842,6 +831,7 @@ const TestHarness = struct {
             &self.store,
             &self.index,
             &self.md,
+            null, // test harness: WAL off
             emb_opt,
             &self.cfg,
             .{

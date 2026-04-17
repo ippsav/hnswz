@@ -34,6 +34,7 @@ const MutableMetadata = @import("metadata_mut.zig").MutableMetadata;
 const ollama = @import("ollama.zig");
 const config_mod = @import("config.zig");
 const heap = @import("heap.zig");
+const wal_mod = @import("wal.zig");
 
 const log = std.log.scoped(.dispatcher);
 
@@ -146,6 +147,11 @@ pub fn Dispatcher(comptime M: usize) type {
         store: *Store,
         index: *Index,
         metadata: *MutableMetadata,
+        /// Optional WAL handle. When non-null, every mutation is
+        /// appended + fsync'd before the in-memory apply. When null,
+        /// writes proceed without durability — used for benchmarks and
+        /// tests where we care about throughput over crash safety.
+        wal: ?*wal_mod.Wal,
 
         // Effectively read-only after init.
         embedder: ?ollama.Embedder,
@@ -200,6 +206,7 @@ pub fn Dispatcher(comptime M: usize) type {
             store: *Store,
             index: *Index,
             metadata: *MutableMetadata,
+            wal: ?*wal_mod.Wal,
             embedder: ?ollama.Embedder,
             cfg: *const config_mod.Config,
             opts: Options,
@@ -249,6 +256,7 @@ pub fn Dispatcher(comptime M: usize) type {
                 .store = store,
                 .index = index,
                 .metadata = metadata,
+                .wal = wal,
                 .embedder = embedder,
                 .cfg = cfg,
                 .workers = workers,
@@ -432,6 +440,31 @@ pub fn Dispatcher(comptime M: usize) type {
             req.status = .ok;
         }
 
+        /// Pre-check whether `level` upper-layer slots are available. Mirrors
+        /// the logic inside `HnswIndex.insertWithLevel` so we can surface
+        /// capacity errors BEFORE writing to the WAL — an acknowledged WAL
+        /// record whose apply fails is an unrecoverable inconsistency.
+        fn hasUpperSlotRoom(self: *const Self, level: u8) bool {
+            if (level == 0) return true;
+            const idx = self.index;
+            if (idx.free_upper_runs[level].items.len > 0) return true;
+            return idx.upper_used + @as(usize, level) <= idx.max_upper_slots;
+        }
+
+        /// Single entry point for "apply raced ahead of WAL" panic paths.
+        /// By the time we call this, a WAL record has been fsync'd but
+        /// the in-memory apply failed. The two states are now divergent
+        /// and there is no safe way to continue; refuse to serve any
+        /// more requests and let the process exit.
+        fn panicPostWalApply(self: *Self, comptime op: []const u8, err: anyerror) noreturn {
+            _ = self;
+            std.debug.panic(
+                "hnswz: " ++ op ++
+                    " failed after WAL fsync (err={s}). In-memory state diverges from WAL; aborting.",
+                .{@errorName(err)},
+            );
+        }
+
         fn handleInsertVec(worker: *Worker, req: *InflightRequest) void {
             const self = worker.dispatcher;
             const view = protocol.decodeInsertVecRequest(req.payload, self.store.dim) catch |err| switch (err) {
@@ -443,14 +476,28 @@ pub fn Dispatcher(comptime M: usize) type {
 
             self.rwlock.lock();
             defer self.rwlock.unlock();
-            const id = self.store.add(worker.vec_scratch) catch return writeErr(req, .out_of_capacity);
-            self.index.insert(&worker.ws, id) catch {
-                self.store.delete(id);
-                return writeErr(req, .internal);
-            };
-            self.metadata.setAt(self.allocator, id, "") catch {
-                self.store.delete(id);
-                return writeErr(req, .internal);
+
+            const reserved_id = self.store.peekNextId() orelse return writeErr(req, .out_of_capacity);
+            const level = self.index.drawLevel();
+            if (!self.hasUpperSlotRoom(level)) return writeErr(req, .out_of_capacity);
+
+            if (self.wal) |wal| {
+                wal.appendInsert(.{
+                    .id = reserved_id,
+                    .level = level,
+                    .vec = worker.vec_scratch,
+                    .name = "",
+                }) catch return writeErr(req, .internal);
+            }
+
+            const id = self.store.add(worker.vec_scratch) catch |err| self.panicPostWalApply("insert_vec/store.add", err);
+            std.debug.assert(id == reserved_id);
+            self.index.insertWithLevel(&worker.ws, id, level) catch |err| self.panicPostWalApply("insert_vec/index.insert", err);
+            self.metadata.setAt(self.allocator, id, "") catch |err| {
+                // Metadata is advisory (the vector + graph are the
+                // authoritative state). Log and continue; the WAL has
+                // the record so a restart will re-attempt the setAt.
+                log.warn("insert_vec: metadata setAt failed: {s}", .{@errorName(err)});
             };
             req.response_len = protocol.encodeIdResponse(req.response_buf, id);
             req.status = .ok;
@@ -469,15 +516,28 @@ pub fn Dispatcher(comptime M: usize) type {
 
             self.rwlock.lock();
             defer self.rwlock.unlock();
-            const id = self.store.add(worker.vec_scratch) catch return writeErr(req, .out_of_capacity);
-            self.index.insert(&worker.ws, id) catch {
-                self.store.delete(id);
-                return writeErr(req, .internal);
-            };
+
+            const reserved_id = self.store.peekNextId() orelse return writeErr(req, .out_of_capacity);
+            const level = self.index.drawLevel();
+            if (!self.hasUpperSlotRoom(level)) return writeErr(req, .out_of_capacity);
+
             const name_len = @min(view.text.len, MAX_NAME_IN_RESPONSE);
-            self.metadata.setAt(self.allocator, id, view.text[0..name_len]) catch {
-                self.store.delete(id);
-                return writeErr(req, .internal);
+            const name = view.text[0..name_len];
+
+            if (self.wal) |wal| {
+                wal.appendInsert(.{
+                    .id = reserved_id,
+                    .level = level,
+                    .vec = worker.vec_scratch,
+                    .name = name,
+                }) catch return writeErr(req, .internal);
+            }
+
+            const id = self.store.add(worker.vec_scratch) catch |err| self.panicPostWalApply("insert_text/store.add", err);
+            std.debug.assert(id == reserved_id);
+            self.index.insertWithLevel(&worker.ws, id, level) catch |err| self.panicPostWalApply("insert_text/index.insert", err);
+            self.metadata.setAt(self.allocator, id, name) catch |err| {
+                log.warn("insert_text: metadata setAt failed: {s}", .{@errorName(err)});
             };
             req.response_len = protocol.encodeIdResponse(req.response_buf, id);
             req.status = .ok;
@@ -491,7 +551,12 @@ pub fn Dispatcher(comptime M: usize) type {
             defer self.rwlock.unlock();
             if (@as(usize, id) >= self.store.count) return writeErr(req, .invalid_id);
             if (self.store.isDeleted(id)) return writeErr(req, .invalid_id);
-            self.index.delete(&worker.ws, id) catch return writeErr(req, .internal);
+
+            if (self.wal) |wal| {
+                wal.appendDelete(.{ .id = id }) catch return writeErr(req, .internal);
+            }
+
+            self.index.delete(&worker.ws, id) catch |err| self.panicPostWalApply("delete/index.delete", err);
             self.metadata.deleteAt(self.allocator, id);
             req.response_len = 0;
             req.status = .ok;
@@ -510,7 +575,21 @@ pub fn Dispatcher(comptime M: usize) type {
             defer self.rwlock.unlock();
             if (@as(usize, view.id) >= self.store.count) return writeErr(req, .invalid_id);
             if (self.store.isDeleted(view.id)) return writeErr(req, .invalid_id);
-            self.index.replaceVector(&worker.ws, view.id, worker.vec_scratch) catch return writeErr(req, .internal);
+
+            const level = self.index.drawLevel();
+            if (!self.hasUpperSlotRoom(level)) return writeErr(req, .out_of_capacity);
+
+            if (self.wal) |wal| {
+                wal.appendReplace(.{
+                    .id = view.id,
+                    .level = level,
+                    .vec = worker.vec_scratch,
+                    .name = null,
+                }) catch return writeErr(req, .internal);
+            }
+
+            self.index.replaceVectorWithLevel(&worker.ws, view.id, worker.vec_scratch, level) catch |err|
+                self.panicPostWalApply("replace_vec/index.replace", err);
             req.response_len = 0;
             req.status = .ok;
         }
@@ -527,10 +606,28 @@ pub fn Dispatcher(comptime M: usize) type {
             defer self.rwlock.unlock();
             if (@as(usize, view.id) >= self.store.count) return writeErr(req, .invalid_id);
             if (self.store.isDeleted(view.id)) return writeErr(req, .invalid_id);
-            self.index.replaceVector(&worker.ws, view.id, worker.vec_scratch) catch return writeErr(req, .internal);
+
+            const level = self.index.drawLevel();
+            if (!self.hasUpperSlotRoom(level)) return writeErr(req, .out_of_capacity);
 
             const name_len = @min(view.text.len, MAX_NAME_IN_RESPONSE);
-            self.metadata.setAt(self.allocator, view.id, view.text[0..name_len]) catch return writeErr(req, .internal);
+            const name = view.text[0..name_len];
+
+            if (self.wal) |wal| {
+                wal.appendReplace(.{
+                    .id = view.id,
+                    .level = level,
+                    .vec = worker.vec_scratch,
+                    .name = name,
+                }) catch return writeErr(req, .internal);
+            }
+
+            self.index.replaceVectorWithLevel(&worker.ws, view.id, worker.vec_scratch, level) catch |err|
+                self.panicPostWalApply("replace_text/index.replace", err);
+
+            self.metadata.setAt(self.allocator, view.id, name) catch |err| {
+                log.warn("replace_text: metadata setAt failed: {s}", .{@errorName(err)});
+            };
             req.response_len = 0;
             req.status = .ok;
         }
@@ -643,7 +740,18 @@ pub fn Dispatcher(comptime M: usize) type {
             return cursor;
         }
 
-        fn snapshotNow(self: *Self) !void {
+        /// Write a snapshot to disk and, if the WAL is enabled, truncate
+        /// it. The caller must hold exclusive access to the shared state
+        /// — either via `self.rwlock.lock()` (live server) or by having
+        /// joined the worker pool (shutdown path).
+        ///
+        /// Ordering guarantee: each writer fsyncs its own file, then we
+        /// fsync the data directory so the dentries are durable, and
+        /// only THEN do we truncate the WAL. A crash between snapshot
+        /// durability and WAL truncate is safe: the snapshot is intact
+        /// and the WAL still holds every record; replay on restart is
+        /// idempotent for inserts whose ids are already present.
+        pub fn snapshotNow(self: *Self) !void {
             std.fs.cwd().makePath(self.cfg.storage.data_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
@@ -651,12 +759,25 @@ pub fn Dispatcher(comptime M: usize) type {
             var dir = try std.fs.cwd().openDir(self.cfg.storage.data_dir, .{});
             defer dir.close();
 
-            const remap = try self.store.buildRemap(self.allocator);
-            defer self.allocator.free(remap);
-
             try self.store.save(dir, self.cfg.storage.vectors_file);
-            try self.index.save(dir, self.cfg.storage.graph_file, remap);
-            try self.metadata.save(self.allocator, dir, self.cfg.storage.metadata_file, remap);
+            try self.index.save(dir, self.cfg.storage.graph_file);
+            try self.metadata.save(
+                self.allocator,
+                dir,
+                self.cfg.storage.metadata_file,
+                self.store.count,
+            );
+
+            // Fsync the directory so the three files' rename-over
+            // (createFile + write + close) is durable before we drop
+            // WAL records that vouch for them.
+            posix.fsync(dir.fd) catch |err| return err;
+
+            if (self.wal) |wal| {
+                wal.truncateAfterSnapshot() catch |err| {
+                    log.warn("snapshot ok but WAL truncate failed: {s}", .{@errorName(err)});
+                };
+            }
         }
     };
 }

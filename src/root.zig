@@ -21,6 +21,8 @@ pub const server = @import("server.zig");
 pub const client = @import("client.zig");
 pub const io = @import("io.zig");
 pub const dispatcher = @import("dispatcher.zig");
+pub const lockfile = @import("lockfile.zig");
+pub const wal = @import("wal.zig");
 
 test {
     _ = @import("distance.zig");
@@ -38,4 +40,6 @@ test {
     _ = @import("client.zig");
     _ = @import("io.zig");
     _ = @import("dispatcher.zig");
+    _ = @import("lockfile.zig");
+    _ = @import("wal.zig");
 }
