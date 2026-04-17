@@ -1,4 +1,9 @@
-# hnswz (WIP)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
+    <img src="assets/banner-light.svg" alt="hnswz — hnsw vector database written in zig" width="820">
+  </picture>
+</p>
 
 A vector database written in Zig. Embeds text locally via [Ollama](https://ollama.com), stores the vectors, and finds nearest neighbors fast using an HNSW index.
 

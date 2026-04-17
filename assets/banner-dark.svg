@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 400" width="1200" height="400" role="img" aria-label="hnswz — hnsw vector database written in zig">
+  <title>hnswz</title>
+  <desc>hnswz banner with monogram, wordmark, and tagline.</desc>
+
+  <style>
+    .wm { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-weight: 600; font-size: 128px; letter-spacing: -5px; fill: #f0f6fc; }
+    .tag { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-weight: 400; font-size: 22px; fill: #8b949e; }
+    .kicker { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-weight: 500; font-size: 13px; fill: #6e7681; letter-spacing: 3px; }
+    .ink { stroke: #f0f6fc; fill: #f0f6fc; }
+    .ink-stroke { stroke: #f0f6fc; fill: none; }
+    .dim { stroke: #f0f6fc; }
+  </style>
+
+  <!-- Glyph block, left-aligned -->
+  <g transform="translate(100, 100)">
+    <!-- Frame -->
+    <rect x="0" y="0" width="200" height="200" class="ink-stroke" stroke-width="2.5"/>
+
+    <!-- Corner registration ticks -->
+    <g class="ink-stroke" stroke-width="2.5">
+      <path d="M0 10 L8 10 M10 0 L10 8"/>
+      <path d="M200 10 L192 10 M190 0 L190 8"/>
+      <path d="M0 190 L8 190 M10 200 L10 192"/>
+      <path d="M200 190 L192 190 M190 200 L190 192"/>
+    </g>
+
+    <!-- Edges -->
+    <line x1="60"  y1="60"  x2="110" y2="86"  class="dim" stroke-width="2.8" stroke-linecap="square"/>
+    <line x1="60"  y1="110" x2="110" y2="86"  class="dim" stroke-width="2.8" stroke-linecap="square"/>
+    <line x1="110" y1="86"  x2="160" y2="110" class="dim" stroke-width="2.8" stroke-linecap="square"/>
+    <line x1="60"  y1="110" x2="60"  y2="160" class="dim" stroke-width="2.8" stroke-linecap="square"/>
+    <line x1="160" y1="110" x2="160" y2="160" class="dim" stroke-width="2.8" stroke-linecap="square"/>
+    <line x1="60"  y1="60"  x2="60"  y2="110" class="dim" stroke-width="1.2" stroke-dasharray="3 3" opacity="0.5"/>
+
+    <!-- Nodes -->
+    <g class="ink">
+      <circle cx="60"  cy="60"  r="6.5"/>
+      <circle cx="110" cy="86"  r="6.5"/>
+      <circle cx="60"  cy="110" r="6.5"/>
+      <circle cx="160" cy="110" r="6.5"/>
+      <circle cx="60"  cy="160" r="6.5"/>
+    </g>
+    <circle cx="160" cy="160" r="9" fill="#f7a41d"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="380" y="225" class="wm">hnswz</text>
+  <text x="382" y="260" class="tag">hnsw vector database · written in zig</text>
+  <text x="382" y="290" class="kicker">FAST · LOCAL · EMBEDDED</text>
+</svg>

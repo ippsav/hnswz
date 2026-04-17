@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="hnswz">
+  <title>hnswz</title>
+  <desc>hnswz monogram. The letter h is constructed from five nodes and six edges arranged as an HNSW three-layer graph: a top-left node on layer 2, a long-range diagonal to the hump peak, layer-1 edges forming the crossbar, and vertical layer-0 stems. The amber node at bottom-right is the entry point.</desc>
+
+  <!-- Frame -->
+  <rect x="13" y="13" width="230" height="230" fill="none" stroke="currentColor" stroke-width="2.5"/>
+
+  <!-- Registration tick marks at corners -->
+  <g stroke="currentColor" stroke-width="2.5" fill="none">
+    <path d="M13 25 L22 25 M25 13 L25 22"/>
+    <path d="M243 25 L234 25 M231 13 L231 22"/>
+    <path d="M13 231 L22 231 M25 243 L25 234"/>
+    <path d="M243 231 L234 231 M231 243 L231 234"/>
+  </g>
+
+  <!-- L2 long-range edge: top-left to peak -->
+  <line x1="72" y1="72" x2="128" y2="100" stroke="currentColor" stroke-width="3" stroke-linecap="square"/>
+
+  <!-- L1 hump edges: left-mid -> peak -> right-mid -->
+  <line x1="72"  y1="128" x2="128" y2="100" stroke="currentColor" stroke-width="3" stroke-linecap="square"/>
+  <line x1="128" y1="100" x2="184" y2="128" stroke="currentColor" stroke-width="3" stroke-linecap="square"/>
+
+  <!-- L0 stems -->
+  <line x1="72"  y1="128" x2="72"  y2="184" stroke="currentColor" stroke-width="3" stroke-linecap="square"/>
+  <line x1="184" y1="128" x2="184" y2="184" stroke="currentColor" stroke-width="3" stroke-linecap="square"/>
+
+  <!-- Layer drop: top-left node also exists on L1 -->
+  <line x1="72" y1="72" x2="72" y2="128" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3 3" opacity="0.5"/>
+
+  <!-- Nodes -->
+  <g fill="currentColor">
+    <circle cx="72"  cy="72"  r="7"/>
+    <circle cx="128" cy="100" r="7"/>
+    <circle cx="72"  cy="128" r="7"/>
+    <circle cx="184" cy="128" r="7"/>
+    <circle cx="72"  cy="184" r="7"/>
+  </g>
+
+  <!-- Entry point terminus -->
+  <circle cx="184" cy="184" r="10" fill="#f7a41d"/>
+</svg>
