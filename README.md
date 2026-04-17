@@ -44,7 +44,11 @@ All runtime knobs live in a JSON config. See [config.example.json](config.exampl
     "max_vectors": 10000,
     "upper_pool_slots": 1000,
     "vectors_file": "vectors.hvsf",
-    "graph_file": "graph.hgrf"
+    "graph_file": "graph.hgrf",
+    "metadata_file": "metadata.hmtf",
+    "wal_file": "wal.hwal",
+    "lock_file": "hnswz.lock",
+    "wal_enabled": true
   },
   "log_level": "info"
 }
@@ -147,12 +151,24 @@ Ollama HTTP call outside the lock, so a slow embed no longer stalls
 other clients. Still, pre-computed `_VEC` variants skip the HTTP
 round-trip entirely and are preferred on the hot path.
 
-**Durability.** Writes live in memory until a snapshot fires. Snapshots
-are triggered explicitly via the `SNAPSHOT` opcode, on the
-`--auto-snapshot-secs` cadence, or once on clean shutdown (`SIGINT` /
-`SIGTERM`). Between snapshots, a crash loses recent writes; a write-ahead
-log is V2. Do NOT run `hnswz build` while `hnswz serve` is live on the
-same `data_dir` — no file locking yet.
+**Durability.** Every mutation is recorded in a write-ahead log
+([src/wal.zig](src/wal.zig)) and fsync'd before the server
+acknowledges the client, so acknowledged writes survive a crash. On
+startup the WAL is replayed on top of the last snapshot, restoring any
+records written since the previous snapshot. When a snapshot completes
+(`SNAPSHOT` opcode, `--auto-snapshot-secs` cadence, or clean shutdown),
+the WAL is atomically truncated via a rename-over-a-temp-file so a
+crash mid-truncate still leaves either the old or new WAL intact. Each
+record is CRC32-protected; a torn write at the tail stops replay at the
+last fully-valid record and the WAL is truncated back to that point.
+
+**Concurrency safety across processes.** `serve`, `build`, and `query`
+all acquire an exclusive `flock(2)` advisory lock on
+`<data_dir>/hnswz.lock`. A second `serve` against the same `data_dir`
+will refuse to start with a clear error, and a concurrent `build` or
+`query` will be rejected the same way. The lock is released on process
+exit (including `SIGKILL` / crash), so a stale lock file can never
+strand a data directory.
 
 ### `client` — one-shot probe against a running `serve`
 
