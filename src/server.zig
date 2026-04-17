@@ -612,6 +612,15 @@ pub fn Server(comptime M: usize) type {
         }
 
         fn onRequestDone(self: *Self, req: *dispatcher_mod.InflightRequest) void {
+            // Detached auto-snapshot has no conn to reply on.
+            if (req.conn_idx == std.math.maxInt(usize)) {
+                if (req.status != .ok) {
+                    log.warn("auto-snapshot failed: {s}", .{protocol.statusMessage(req.status)});
+                }
+                self.dispatcher.releaseRequest(req);
+                return;
+            }
+
             const i = req.conn_idx;
             const c = &self.conns[i];
             // Encode the frame header. The worker has already placed
@@ -1180,6 +1189,51 @@ test "SNAPSHOT writes files that round-trip with existing load" {
     defer loaded.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), loaded.live_count);
     try testing.expectEqualSlices(u8, vb, std.mem.sliceAsBytes(loaded.get(0)));
+}
+
+test "auto-snapshot fires without crashing (detached request sentinel)" {
+    var h: TestHarness = undefined;
+    const dim: usize = 4;
+    try h.setUp(testing.allocator, dim, 8, 4);
+    defer h.tearDown();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const real = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(real);
+    h.cfg.storage.data_dir = real;
+
+    // Force auto-snapshot to fire on the very next tick.
+    h.srv.snapshot_interval_ns = 1;
+    h.srv.last_snapshot_ns = 0;
+
+    const port = h.srv.bound_port;
+    try h.start();
+
+    const stream = try connect(port);
+    defer stream.close();
+
+    // Insert something so the snapshot has payload.
+    var vec: [dim]f32 = .{ 1, 0, 0, 0 };
+    const vb = std.mem.sliceAsBytes(vec[0..]);
+    var ireq: [2 + dim * 4]u8 = undefined;
+    const in = protocol.encodeInsertVecRequest(&ireq, 0, vb);
+    var resp: [128]u8 = undefined;
+    _ = try roundTrip(stream, .insert_vec, 1, ireq[0..in], &resp);
+
+    // Give the tick timer (100 ms) a few iterations to fire and the
+    // auto-snapshot to complete via the worker pool.
+    std.Thread.sleep(400 * std.time.ns_per_ms);
+
+    // Server must still be responsive — this is the regression guard
+    // for the OOB read on the detached conn_idx sentinel.
+    const r = try roundTrip(stream, .ping, 2, "", &resp);
+    try testing.expectEqual(@as(u8, 0), r.header.tag);
+
+    // Snapshot files should exist on disk.
+    var loaded = try Store.load(testing.allocator, tmp.dir, h.cfg.storage.vectors_file, null);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), loaded.live_count);
 }
 
 test "multiple sequential requests on one connection" {
