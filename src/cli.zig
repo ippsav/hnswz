@@ -475,7 +475,7 @@ pub fn printUsage() !void {
     const usage =
         \\Usage:
         \\  hnswz build      --config <path> --source <dir>
-        \\  hnswz query      --config <path> [--top-k <n>]
+        \\  hnswz query      [--connect host:port] [--top-k <n>] [--ef <n>]
         \\  hnswz benchmark  [--config <path>] [benchmark flags]
         \\  hnswz serve      --config <path> [serve flags]
         \\  hnswz client     [--connect host:port] <verb> [verb args/flags]
@@ -484,8 +484,10 @@ pub fn printUsage() !void {
         \\  build      Ingest every .txt file in <dir>, embed via Ollama, build
         \\             the HNSW graph, and persist vectors/graph/metadata to
         \\             config.storage.data_dir.
-        \\  query      Load a prebuilt index and enter a REPL reading queries
-        \\             from stdin (one per line). Ctrl-D or :q exits.
+        \\  query      Interactive REPL over a running `hnswz serve`. Bare
+        \\             text lines run search-text; colon commands (:stats,
+        \\             :get, :insert, :replace, :delete, :snapshot, :ping,
+        \\             :help) invoke the other server verbs. Ctrl-D or :q exits.
         \\  benchmark  Run an end-to-end build+search workload on synthetic
         \\             vectors and print latency/throughput. Intended as the
         \\             performance regression signal across commits.
@@ -497,12 +499,17 @@ pub fn printUsage() !void {
         \\
         \\Options:
         \\  --config <path>   Path to JSON config (or set HNSWZ_CONFIG env var).
-        \\                    Required for build/query/serve; optional for
-        \\                    benchmark (benchmark has its own defaults; if a
-        \\                    config is provided, dim/ef_*/seed are inherited).
+        \\                    Required for build/serve; optional for benchmark
+        \\                    (benchmark has its own defaults; if a config is
+        \\                    provided, dim/ef_*/seed are inherited).
         \\  --source <dir>    (build only) Directory of .txt files to ingest.
-        \\  --top-k <n>       (query/benchmark) Results per query. Default 5
-        \\                    for query, 10 for benchmark.
+        \\  --top-k <n>       (query/benchmark/client) Results per search.
+        \\                    Default 5 for query/client, 10 for benchmark.
+        \\
+        \\Query options:
+        \\  --connect <host:port>  Server to connect to. Default 127.0.0.1:9000.
+        \\  --ef <n>               Search-time candidate pool. Defaults to
+        \\                         max(top_k, 10).
         \\
         \\Benchmark options:
         \\  --num-vectors <n>      Dataset size. Default 10000.
