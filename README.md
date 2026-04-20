@@ -12,7 +12,7 @@ A vector database written in Zig. Embeds text locally via [Ollama](https://ollam
 ## Requirements
 
 - Zig `>= 0.15.2`
-- [Ollama](https://ollama.com) running locally with an embedding model pulled (only needed for `build` / `query`)
+- [Ollama](https://ollama.com) running locally with an embedding model pulled (only needed for `build` and `serve`; `query` and `client` talk to `serve` over TCP)
 
 ## Build
 
@@ -59,7 +59,7 @@ All runtime knobs live in a JSON config. See [config.example.json](config.exampl
 }
 ```
 
-Pass the path with `--config <path>` or set the `HNSWZ_CONFIG` environment variable.
+Pass `--config <path>` or set `HNSWZ_CONFIG`. Accepted by `build`, `benchmark`, and `serve` only — `query` and `client` connect to a running `serve` and don't need it.
 
 ## Usage
 
@@ -75,10 +75,10 @@ hnswz build --config config.json --source ./docs
 
 ### `query` — interactive REPL
 
-Loads a prebuilt index and reads queries from stdin. Each query is embedded, searched, and the top-k nearest filenames + distances are printed. Exit with `Ctrl-D` or `:q`.
+Connects to a running `hnswz serve` over TCP. Bare lines run `search-text`; colon commands (`:stats`, `:ping`, `:get`, `:insert`, `:replace`, `:delete`, `:snapshot`, `:help`) invoke the other server verbs. Exit with `Ctrl-D` or `:q`.
 
 ```sh
-hnswz query --config config.json [--top-k 5]
+hnswz query [--connect 127.0.0.1:9000] [--top-k 5] [--ef 10]
 ```
 
 ### `benchmark` — synthetic perf regression harness
@@ -106,8 +106,10 @@ Flags:
 | `--validate` | off | compute recall@k against brute force |
 | `--json` | off | machine-readable output |
 | `--dataset <dir>` | off | load base/query/groundtruth from SIFT-style `.fvecs`/`.ivecs` (sets `--dim` from file; uses shipped groundtruth for recall) |
+| `--transport <t>` | `in-process` | `in-process` or `tcp` (spawn a server thread and drive it over the wire; delta is protocol overhead) |
 | `--concurrent-clients <n>` | `1` | TCP search phase clients in parallel (driver threads) |
 | `--server-workers <n>` | `0` (auto) | TCP server worker-pool size |
+| `--bench-protocol` | off | skip build+search; measure PING + 1-vec SEARCH_VEC RTT only (implies `--transport tcp`) |
 
 > Run release-mode for meaningful numbers: `zig build -Doptimize=ReleaseFast`.
 
@@ -181,7 +183,7 @@ Flags:
 | `--max-connections <n>` | `64` | concurrent connection cap |
 | `--max-frame-bytes <n>` | `64 MiB` | reject frames larger than this |
 | `--idle-timeout-secs <n>` | `60` | close idle connections |
-| `--workers <n>` | `0` (auto = cpu-2) | worker-pool size for HNSW compute |
+| `--workers <n>` / `--n-workers <n>` | `0` (auto = cpu-2) | worker-pool size for HNSW compute |
 
 **Wire format.** Every frame is a 9-byte header (`u32 body_len | u8
 opcode_or_status | u32 req_id`) followed by an opcode-specific payload.
@@ -214,11 +216,10 @@ crash mid-truncate still leaves either the old or new WAL intact. Each
 record is CRC32-protected; a torn write at the tail stops replay at the
 last fully-valid record and the WAL is truncated back to that point.
 
-**Concurrency safety across processes.** `serve`, `build`, and `query`
-all acquire an exclusive `flock(2)` advisory lock on
-`<data_dir>/hnswz.lock`. A second `serve` against the same `data_dir`
-will refuse to start with a clear error, and a concurrent `build` or
-`query` will be rejected the same way. The lock is released on process
+**Concurrency safety across processes.** `serve` and `build` acquire
+an exclusive `flock(2)` advisory lock on `<data_dir>/hnswz.lock`. A
+second `serve` or concurrent `build` against the same `data_dir`
+refuses to start with a clear error. The lock is released on process
 exit (including `SIGKILL` / crash), so a stale lock file can never
 strand a data directory.
 
