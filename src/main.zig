@@ -20,7 +20,10 @@ pub fn main() !void {
         .client => {
             try runClient(allocator, &args);
         },
-        .build, .query, .serve => {
+        .query => {
+            try runQuery(allocator, &args);
+        },
+        .build, .serve => {
             const path = args.config_path orelse {
                 log.err("{s} requires --config <path> (or set {s})", .{
                     @tagName(args.subcommand), cli.CONFIG_ENV_VAR,
@@ -52,14 +55,10 @@ pub fn main() !void {
                     };
                     try runBuild(allocator, cfg, src);
                 },
-                .query => {
-                    const top_k = args.top_k orelse cli.DEFAULT_TOP_K;
-                    try runQuery(allocator, cfg, top_k);
-                },
                 .serve => {
                     try runServe(allocator, cfg, &args);
                 },
-                .benchmark, .client => unreachable,
+                .benchmark, .client, .query => unreachable,
             }
         },
         .benchmark => {
@@ -216,151 +215,46 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, sourc
     log.info("index built: {d} vectors saved to {s}", .{ n, cfg.storage.data_dir });
 }
 
-fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k: usize) !void {
-    if (top_k > cfg.index.ef_search) {
-        log.err("--top-k ({d}) must be <= config.index.ef_search ({d})", .{ top_k, cfg.index.ef_search });
+/// REPL over a running `hnswz serve`. Bare lines run SEARCH_TEXT; colon
+/// commands invoke the rest of the server verbs.
+fn runQuery(allocator: std.mem.Allocator, args: *const cli.Args) !void {
+    const connect = args.client_connect orelse "127.0.0.1:9000";
+    const parts = splitHostPort(connect) orelse {
+        log.err("--connect must be host:port (got '{s}')", .{connect});
         std.process.exit(cli.USAGE_EXIT_CODE);
-    }
-
-    var data_dir = std.fs.cwd().openDir(cfg.storage.data_dir, .{}) catch |err| {
-        log.err("cannot open storage.data_dir '{s}': {s}", .{ cfg.storage.data_dir, @errorName(err) });
-        std.process.exit(1);
     };
-    defer data_dir.close();
-
-    // Query holds the lock for its entire lifetime — the REPL needs
-    // a point-in-time view and a concurrent `serve` writing under us
-    // would break that.
-    var lock = hnswz.lockfile.LockFile.acquire(data_dir, cfg.storage.lock_file) catch |err| switch (err) {
-        error.AlreadyLocked => {
-            log.err("data_dir '{s}' is already locked by another hnswz process", .{cfg.storage.data_dir});
-            std.process.exit(1);
-        },
-        else => {
-            log.err("cannot acquire lock on '{s}/{s}': {s}", .{ cfg.storage.data_dir, cfg.storage.lock_file, @errorName(err) });
-            std.process.exit(1);
-        },
-    };
-    defer lock.release();
-
-    var store = hnswz.Store.load(allocator, data_dir, cfg.storage.vectors_file, cfg.storage.max_vectors) catch |err| {
-        log.err("cannot load vectors file '{s}/{s}': {s}", .{
-            cfg.storage.data_dir, cfg.storage.vectors_file, @errorName(err),
-        });
-        std.process.exit(1);
-    };
-    defer store.deinit(allocator);
-
-    if (store.dim != cfg.embedder.dim) {
-        log.err("vectors file dim ({d}) != config embedder.dim ({d})", .{ store.dim, cfg.embedder.dim });
-        std.process.exit(1);
-    }
-
-    const Index = hnswz.HnswIndex(M);
-
-    const file_sz = Index.scanSize(data_dir, cfg.storage.graph_file) catch |err| {
-        log.err("cannot scan graph file '{s}/{s}': {s}", .{
-            cfg.storage.data_dir, cfg.storage.graph_file, @errorName(err),
-        });
-        std.process.exit(1);
+    const addr = std.net.Address.parseIp(parts.host, parts.port) catch |err| {
+        log.err("invalid connect address '{s}': {s}", .{ connect, @errorName(err) });
+        std.process.exit(cli.USAGE_EXIT_CODE);
     };
 
-    const upper_slots = @max(cfg.storage.upper_pool_slots, file_sz.upper_slots);
-
-    var index = Index.load(allocator, &store, data_dir, cfg.storage.graph_file, .{
-        .max_vectors = cfg.storage.max_vectors,
-        .max_upper_slots = upper_slots,
-        .ef_construction = cfg.index.ef_construction,
-        .seed = cfg.index.seed,
+    var client = hnswz.client.Client.connect(allocator, addr, .{
+        .recv_buf_size = 4 * 1024 * 1024,
+        .send_buf_size = 4 * 1024 * 1024,
     }) catch |err| {
-        log.err("graph load failed: {s}", .{@errorName(err)});
+        log.err("cannot connect to {s}: {s}", .{ connect, @errorName(err) });
         std.process.exit(1);
     };
-    defer index.deinit();
-
-    // Use a MutableMetadata so we can layer in WAL replay results on
-    // top of whatever was in the static sidecar.
-    var md = hnswz.metadata_mut.MutableMetadata.init();
-    defer md.deinit(allocator);
-    try md.ensureCapacity(allocator, cfg.storage.max_vectors);
-    {
-        var static_md = hnswz.metadata.load(allocator, data_dir, cfg.storage.metadata_file) catch |err| {
-            log.err("cannot load metadata file '{s}/{s}': {s}", .{
-                cfg.storage.data_dir, cfg.storage.metadata_file, @errorName(err),
-            });
-            std.process.exit(1);
-        };
-        defer static_md.deinit(allocator);
-
-        if (static_md.count != store.count or static_md.live_count != store.live_count) {
-            log.err(
-                "metadata slots ({d}/{d}) != vectors slots ({d}/{d})",
-                .{ static_md.live_count, static_md.count, store.live_count, store.count },
-            );
-            std.process.exit(1);
-        }
-        for (0..static_md.count) |i| {
-            const id: u32 = @intCast(i);
-            if (static_md.isTombstone(id)) continue;
-            try md.setAt(allocator, id, static_md.get(id));
-        }
-    }
-
-    // Replay any WAL records that post-date the snapshot. This lets
-    // `hnswz query` see writes made by a previous `serve` session that
-    // crashed before snapshotting.
-    {
-        var res = hnswz.wal.Wal.open(
-            allocator,
-            data_dir,
-            cfg.storage.wal_file,
-            @intCast(cfg.embedder.dim),
-            &store,
-            &index,
-            &md,
-        ) catch |err| switch (err) {
-            error.DimMismatch => {
-                log.err("WAL dim mismatch — config.embedder.dim changed since last run?", .{});
-                std.process.exit(1);
-            },
-            else => {
-                log.err("cannot open WAL '{s}/{s}': {s}", .{ cfg.storage.data_dir, cfg.storage.wal_file, @errorName(err) });
-                std.process.exit(1);
-            },
-        };
-        defer res.wal.close();
-        if (res.replayed > 0) log.info("replayed {d} WAL record(s){s}", .{
-            res.replayed,
-            if (res.truncated) " (truncated at corruption)" else "",
-        });
-    }
-
-    log.info("index loaded: {d} vectors, dim={d}, upper_slots={d}/{d}", .{
-        index.node_count, store.dim, index.upper_used, index.max_upper_slots,
-    });
-
-    var client = try hnswz.OllamaClient.init(
-        allocator,
-        cfg.embedder.model,
-        cfg.embedder.base_url,
-        .{ .max_text_bytes = cfg.embedder.max_text_bytes, .dim = cfg.embedder.dim },
-    );
     defer client.deinit();
-    const embedder = client.embedder();
 
-    var ws = try Index.Workspace.init(allocator, cfg.storage.max_vectors, cfg.index.max_ef);
-    defer ws.deinit(allocator);
+    const top_k: u16 = @intCast(args.top_k orelse cli.DEFAULT_TOP_K);
+    const ef: u16 = if (args.client_ef) |e| @intCast(e) else @max(top_k, 10);
 
-    const qvec = try allocator.alloc(f32, cfg.embedder.dim);
-    defer allocator.free(qvec);
+    // One STATS up front: it verifies the server speaks our protocol and
+    // hands back `dim`, which :get needs to size its vec buffer (the
+    // response payload has no length prefix for the vec).
+    const initial_stats = client.stats() catch |err| {
+        log.err("initial stats failed: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const dim = initial_stats.dim;
 
-    const results_buf = try allocator.alloc(hnswz.heap.Entry, top_k);
-    defer allocator.free(results_buf);
-
-    // Line buffer is sized to cfg.embedder.max_text_bytes so any query that
-    // the embedder could accept also fits in one line. Allocated once at
-    // startup — no per-query allocation.
-    const line_buf = try allocator.alloc(u8, cfg.embedder.max_text_bytes);
+    // Protocol caps text_len at u16 = 65535 anyway; pick a line buffer
+    // that fits any text the server could accept. The server may enforce
+    // a stricter `max_text_bytes` from its config and reject with
+    // text_too_long; we surface that verbatim.
+    const LINE_BUF_BYTES: usize = 65 * 1024;
+    const line_buf = try allocator.alloc(u8, LINE_BUF_BYTES);
     defer allocator.free(line_buf);
 
     var stdin_file_reader = std.fs.File.stdin().readerStreaming(line_buf);
@@ -370,7 +264,10 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
     var stdout_file_writer = std.fs.File.stdout().writer(&out_buf);
     const out = &stdout_file_writer.interface;
 
-    try out.writeAll("hnswz query REPL — type a query and press Enter. Ctrl-D or :q to exit.\n");
+    try out.print(
+        "hnswz query — connected to {s} (dim={d}, live={d}). :help for commands, :q to exit.\n",
+        .{ connect, dim, initial_stats.live_count },
+    );
     try out.flush();
 
     while (true) {
@@ -379,8 +276,7 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
 
         const raw = in.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
-                try out.print("query too long (max {d} bytes); try a shorter query\n", .{line_buf.len});
-                // Drain the rest of the oversized line so the next prompt is clean.
+                try out.print("line too long (max {d} bytes)\n", .{line_buf.len});
                 _ = in.discardDelimiterInclusive('\n') catch {};
                 try out.flush();
                 continue;
@@ -397,28 +293,149 @@ fn runQuery(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, top_k
         };
         const line = std.mem.trim(u8, line_opt, " \t\r\n");
         if (line.len == 0) continue;
-        if (std.mem.eql(u8, line, ":q") or std.mem.eql(u8, line, ":quit") or std.mem.eql(u8, line, ":exit")) {
-            break;
-        }
 
-        embedder.embed(line, qvec) catch |err| {
-            try out.print("embed failed: {s}\n", .{@errorName(err)});
-            try out.flush();
-            continue;
+        const action = dispatchQueryReplLine(allocator, &client, line, dim, top_k, ef, out) catch |err| {
+            if (err == error.ServerError) {
+                try replPrintServerError(&client, out);
+                try out.flush();
+                continue;
+            }
+            log.err("connection error: {s}", .{@errorName(err)});
+            return err;
         };
-        if (cfg.embedder.normalize) hnswz.bruteforce.normalize(qvec);
-
-        const results = index.search(&ws, qvec, top_k, cfg.index.ef_search, results_buf) catch |err| {
-            try out.print("search failed: {s}\n", .{@errorName(err)});
-            try out.flush();
-            continue;
-        };
-
-        for (results) |r| {
-            try out.print("{s}\t{d:.6}\n", .{ md.get(r.id) orelse "", r.dist });
-        }
         try out.flush();
+        if (action == .exit) break;
     }
+}
+
+const ReplAction = enum { continue_, exit };
+
+fn dispatchQueryReplLine(
+    allocator: std.mem.Allocator,
+    client: *hnswz.client.Client,
+    line: []const u8,
+    dim: usize,
+    top_k: u16,
+    ef: u16,
+    out: *std.io.Writer,
+) !ReplAction {
+    if (!std.mem.startsWith(u8, line, ":")) {
+        const results = try client.searchText(line, top_k, ef);
+        defer client.freeSearchResults(results);
+        for (results) |r| {
+            try out.print("{d}\t{d:.6}\t{s}\n", .{ r.id, r.dist, r.name });
+        }
+        return .continue_;
+    }
+
+    // Colon command. Split verb from the rest on the first whitespace.
+    const sep = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+    const cmd = line[0..sep];
+    const rest = std.mem.trim(u8, line[sep..], " \t");
+
+    if (std.mem.eql(u8, cmd, ":q") or std.mem.eql(u8, cmd, ":quit") or std.mem.eql(u8, cmd, ":exit")) {
+        return .exit;
+    }
+    if (std.mem.eql(u8, cmd, ":help") or std.mem.eql(u8, cmd, ":h")) {
+        try writeQueryReplHelp(out);
+        return .continue_;
+    }
+    if (std.mem.eql(u8, cmd, ":ping")) {
+        try client.ping();
+        try out.writeAll("OK\n");
+        return .continue_;
+    }
+    if (std.mem.eql(u8, cmd, ":stats")) {
+        const s = try client.stats();
+        try writeStats(out, s, false);
+        return .continue_;
+    }
+    if (std.mem.eql(u8, cmd, ":snapshot")) {
+        const elapsed = try client.snapshot();
+        try out.print("snapshot: {d} ns\n", .{elapsed});
+        return .continue_;
+    }
+    if (std.mem.eql(u8, cmd, ":get")) {
+        const id = (try parseReplIdArg(rest, out, ":get")) orelse return .continue_;
+        const got = try client.get(id, dim);
+        defer allocator.free(got.name);
+        defer allocator.free(got.vec);
+        try writeGet(out, got.name, got.vec, false, false);
+        return .continue_;
+    }
+    if (std.mem.eql(u8, cmd, ":delete")) {
+        const id = (try parseReplIdArg(rest, out, ":delete")) orelse return .continue_;
+        try client.delete(id);
+        try out.writeAll("OK\n");
+        return .continue_;
+    }
+    if (std.mem.eql(u8, cmd, ":insert")) {
+        if (rest.len == 0) {
+            try out.writeAll("error: :insert requires <text>\n");
+            return .continue_;
+        }
+        const id = try client.insertText(rest);
+        try out.print("id={d}\n", .{id});
+        return .continue_;
+    }
+    if (std.mem.eql(u8, cmd, ":replace")) {
+        const arg_sep = std.mem.indexOfAny(u8, rest, " \t") orelse {
+            try out.writeAll("error: :replace requires <id> <text>\n");
+            return .continue_;
+        };
+        const id_str = rest[0..arg_sep];
+        const text = std.mem.trim(u8, rest[arg_sep..], " \t");
+        const id = std.fmt.parseInt(u32, id_str, 10) catch {
+            try out.writeAll("error: :replace <id> must be a non-negative integer\n");
+            return .continue_;
+        };
+        if (text.len == 0) {
+            try out.writeAll("error: :replace requires <text> after <id>\n");
+            return .continue_;
+        }
+        try client.replaceText(id, text);
+        try out.writeAll("OK\n");
+        return .continue_;
+    }
+    try out.print("unknown command '{s}' (try :help)\n", .{cmd});
+    return .continue_;
+}
+
+fn parseReplIdArg(rest: []const u8, out: *std.io.Writer, cmd: []const u8) !?u32 {
+    if (rest.len == 0) {
+        try out.print("error: {s} requires an <id>\n", .{cmd});
+        return null;
+    }
+    return std.fmt.parseInt(u32, rest, 10) catch {
+        try out.print("error: {s} <id> must be a non-negative integer\n", .{cmd});
+        return null;
+    };
+}
+
+fn replPrintServerError(client: *hnswz.client.Client, out: *std.io.Writer) !void {
+    const status = @intFromEnum(client.last_status);
+    const msg = if (client.last_message.len > 0)
+        client.last_message
+    else
+        hnswz.protocol.statusMessage(client.last_status);
+    try out.print("error (status={d}): {s}\n", .{ status, msg });
+}
+
+fn writeQueryReplHelp(out: *std.io.Writer) !void {
+    try out.writeAll(
+        \\Commands:
+        \\  <text>                 search-text for <text> (top-k ranked results)
+        \\  :stats                 server index state
+        \\  :ping                  round-trip check
+        \\  :get <id>              fetch name + vec summary for <id>
+        \\  :insert <text>         insert a document; prints new id
+        \\  :replace <id> <text>   replace <id> with new <text>
+        \\  :delete <id>           tombstone <id>
+        \\  :snapshot              flush index to disk
+        \\  :help | :h             this help
+        \\  :q | :quit | :exit     exit
+        \\
+    );
 }
 
 /// Split "host:port" on the LAST colon so IPv6 literals (when supported
