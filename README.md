@@ -12,7 +12,7 @@ A vector database written in Zig. Embeds text locally via [Ollama](https://ollam
 ## Requirements
 
 - Zig `>= 0.15.2`
-- [Ollama](https://ollama.com) running locally with an embedding model pulled (only needed for `build` / `query`)
+- [Ollama](https://ollama.com) running locally with an embedding model pulled (needed by `build` during ingest and by `serve` when it handles text verbs)
 
 ## Build
 
@@ -73,13 +73,35 @@ Embeds every `.txt` file in `<dir>` via Ollama, builds the HNSW graph, and write
 hnswz build --config config.json --source ./docs
 ```
 
-### `query` — interactive REPL
+### `query` — interactive REPL over a running `serve`
 
-Loads a prebuilt index and reads queries from stdin. Each query is embedded, searched, and the top-k nearest filenames + distances are printed. Exit with `Ctrl-D` or `:q`.
+Opens a REPL that talks to `hnswz serve` over the binary TCP protocol — no
+config, no lockfile, no in-process index. Bare text lines run `search-text`
+and print the top-k ranked results (`id<TAB>dist<TAB>name`). Colon commands
+invoke the other server verbs:
+
+| command | action |
+|---|---|
+| `<text>` | `search-text`; prints top-k |
+| `:stats` | server index state (dim, live_count, upper_used, …) |
+| `:ping` | round-trip check |
+| `:get <id>` | fetch name + vec summary for `<id>` |
+| `:insert <text>` | embed + insert a document; prints new id |
+| `:replace <id> <text>` | embed + replace `<id>` with `<text>` |
+| `:delete <id>` | tombstone `<id>` |
+| `:snapshot` | flush index to disk |
+| `:help` / `:h` | command list |
+| `:q` / `:quit` / `:exit` / `Ctrl-D` | exit |
 
 ```sh
-hnswz query --config config.json [--top-k 5]
+hnswz serve --config config.json &
+hnswz query [--connect 127.0.0.1:9000] [--top-k 5] [--ef 50]
 ```
+
+`--connect` defaults to `127.0.0.1:9000`. `--ef` defaults to `max(top_k, 10)`.
+Server-level errors (e.g. `dim_mismatch`, `embed_failed`, `text_too_long`) are
+printed with their status code and the REPL keeps running; only connection-
+level failures exit.
 
 ### `benchmark` — synthetic perf regression harness
 
@@ -214,13 +236,14 @@ crash mid-truncate still leaves either the old or new WAL intact. Each
 record is CRC32-protected; a torn write at the tail stops replay at the
 last fully-valid record and the WAL is truncated back to that point.
 
-**Concurrency safety across processes.** `serve`, `build`, and `query`
-all acquire an exclusive `flock(2)` advisory lock on
-`<data_dir>/hnswz.lock`. A second `serve` against the same `data_dir`
-will refuse to start with a clear error, and a concurrent `build` or
-`query` will be rejected the same way. The lock is released on process
-exit (including `SIGKILL` / crash), so a stale lock file can never
-strand a data directory.
+**Concurrency safety across processes.** `serve` and `build` acquire an
+exclusive `flock(2)` advisory lock on `<data_dir>/hnswz.lock`. A second
+`serve` against the same `data_dir` will refuse to start with a clear
+error, and a concurrent `build` will be rejected the same way. `query`
+and `client` hold no lock — they talk to `serve` over TCP and never
+touch `data_dir`. The lock is released on process exit (including
+`SIGKILL` / crash), so a stale lock file can never strand a data
+directory.
 
 ### `client` — one-shot probe against a running `serve`
 
