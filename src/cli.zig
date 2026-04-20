@@ -39,89 +39,140 @@ pub const ClientVerb = enum {
     search_vec,
 };
 
-/// Parsed command-line arguments. Owns the heap allocations referenced by
-/// `config_path` and `source_dir`; call `deinit` once the value is no
-/// longer needed.
-///
-/// `config_path` is optional because the `benchmark` subcommand runs fine
-/// without one (it has its own defaults). `build` and `query` enforce
-/// presence at dispatch time.
-///
-/// `top_k` is shared between `query` and `benchmark`; when null each
-/// subcommand applies its own default (DEFAULT_TOP_K vs DEFAULT_BENCH_TOP_K).
-pub const Args = struct {
-    subcommand: Subcommand,
-    config_path: ?[]u8 = null,
-    source_dir: ?[]u8 = null, // build only
-    top_k: ?usize = null, // query / benchmark
+pub const BuildArgs = struct {
+    source_dir: ?[]u8 = null,
 
-    // benchmark-only knobs. All optional; main.zig resolves missing values
-    // against the config (if any) and then against benchmark defaults.
-    bench_num_vectors: ?usize = null,
-    bench_num_queries: ?usize = null,
-    bench_dim: ?usize = null,
-    bench_ef_construction: ?usize = null,
-    bench_ef_search: ?usize = null,
-    bench_seed: ?u64 = null,
-    bench_warmup: ?usize = null,
-    bench_validate: bool = false,
-    bench_json: bool = false,
-    bench_transport: ?BenchTransport = null,
-    /// Concurrent client threads for the TCP search phase. Default 1.
-    bench_concurrent_clients: ?usize = null,
-    /// Server-side worker count for `--transport tcp`. Default 0 = auto.
-    bench_server_workers: ?usize = null,
-    /// If true, run only the protocol-floor micro-benchmark (PING RTT +
-    /// 1-vector SEARCH_VEC RTT). Skips the build+search workload entirely.
-    /// Implies `--transport tcp`.
-    bench_protocol: bool = false,
-    /// Directory holding SIFT-style `*base.fvecs` / `*query.fvecs` /
-    /// optional `*groundtruth.ivecs`. When set, the benchmark replaces
-    /// the seeded PRNG with vectors loaded from this directory and
-    /// infers `dim` from the file.
-    bench_dataset: ?[]u8 = null,
-
-    // serve-only knobs. All optional; main.zig falls back to ServeOptions defaults.
-    serve_listen: ?[]u8 = null, // "host:port"
-    serve_auto_snapshot_secs: ?u32 = null,
-    serve_max_connections: ?u32 = null,
-    serve_max_frame_bytes: ?usize = null,
-    serve_idle_timeout_secs: ?u32 = null,
-    /// 0 (or unset) = auto; otherwise the size of the worker pool.
-    serve_n_workers: ?usize = null,
-
-    // client-only knobs. `client_pos0` / `client_pos1` carry verb-specific
-    // positional args (e.g. `delete <id>` has pos0="42"). Interpretation
-    // happens in runClient, not here.
-    client_verb: ?ClientVerb = null,
-    client_connect: ?[]u8 = null,
-    client_pos0: ?[]u8 = null,
-    client_pos1: ?[]u8 = null,
-    client_dim: ?usize = null,
-    client_ef: ?u32 = null,
-    client_from_file: ?[]u8 = null,
-    client_from_stdin: bool = false,
-    client_literal: ?[]u8 = null,
-    client_full_vec: bool = false,
-    client_json: bool = false,
-
-    pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
-        if (self.config_path) |p| allocator.free(p);
-        if (self.source_dir) |s| allocator.free(s);
-        if (self.serve_listen) |p| allocator.free(p);
-        if (self.client_connect) |p| allocator.free(p);
-        if (self.client_pos0) |p| allocator.free(p);
-        if (self.client_pos1) |p| allocator.free(p);
-        if (self.client_from_file) |p| allocator.free(p);
-        if (self.client_literal) |p| allocator.free(p);
-        if (self.bench_dataset) |p| allocator.free(p);
+    pub fn deinit(self: *BuildArgs, allocator: std.mem.Allocator) void {
+        if (self.source_dir) |p| allocator.free(p);
         self.* = undefined;
     }
 };
 
-/// Errors `parse` can surface. Ordered roughly as the user would hit them.
-/// `HelpRequested` is modelled as an error so `parse` stays a pure function;
-/// `parseOrExit` turns it into a normal `exit(0)` with usage printed.
+pub const QueryArgs = struct {
+    connect: ?[]u8 = null,
+    top_k: ?usize = null,
+    ef: ?u32 = null,
+
+    pub fn deinit(self: *QueryArgs, allocator: std.mem.Allocator) void {
+        if (self.connect) |p| allocator.free(p);
+        self.* = undefined;
+    }
+};
+
+pub const BenchArgs = struct {
+    num_vectors: ?usize = null,
+    num_queries: ?usize = null,
+    dim: ?usize = null,
+    ef_construction: ?usize = null,
+    ef_search: ?usize = null,
+    seed: ?u64 = null,
+    warmup: ?usize = null,
+    top_k: ?usize = null,
+    validate: bool = false,
+    json: bool = false,
+    transport: ?BenchTransport = null,
+    /// If true, run only the protocol-floor micro-benchmark (PING RTT +
+    /// 1-vector SEARCH_VEC RTT). Skips the build+search workload entirely.
+    /// Implies `--transport tcp`.
+    bench_protocol: bool = false,
+    /// Concurrent client threads for the TCP search phase. Default 1.
+    concurrent_clients: ?usize = null,
+    /// Server-side worker count for `--transport tcp`. Default 0 = auto.
+    server_workers: ?usize = null,
+    /// Directory holding SIFT-style `*base.fvecs` / `*query.fvecs` /
+    /// optional `*groundtruth.ivecs`. When set, the benchmark replaces
+    /// the seeded PRNG with vectors loaded from this directory and
+    /// infers `dim` from the file.
+    dataset: ?[]u8 = null,
+
+    pub fn deinit(self: *BenchArgs, allocator: std.mem.Allocator) void {
+        if (self.dataset) |p| allocator.free(p);
+        self.* = undefined;
+    }
+};
+
+pub const ServeArgs = struct {
+    listen: ?[]u8 = null, // "host:port"
+    auto_snapshot_secs: ?u32 = null,
+    max_connections: ?u32 = null,
+    max_frame_bytes: ?usize = null,
+    idle_timeout_secs: ?u32 = null,
+    /// 0 (or unset) = auto; otherwise the size of the worker pool.
+    n_workers: ?usize = null,
+
+    pub fn deinit(self: *ServeArgs, allocator: std.mem.Allocator) void {
+        if (self.listen) |p| allocator.free(p);
+        self.* = undefined;
+    }
+};
+
+pub const ClientArgs = struct {
+    /// `null` during parsing before the verb positional is seen; populated
+    /// as soon as it is. `parseOrExit` enforces presence at dispatch time.
+    verb: ?ClientVerb = null,
+    connect: ?[]u8 = null,
+    /// Verb-specific positional args (e.g. `delete <id>` has pos0="42",
+    /// `replace-text <id> <text>` has pos0=id and pos1=text). No verb
+    /// takes more than two positionals.
+    pos0: ?[]u8 = null,
+    pos1: ?[]u8 = null,
+    dim: ?usize = null,
+    top_k: ?usize = null,
+    ef: ?u32 = null,
+    from_file: ?[]u8 = null,
+    from_stdin: bool = false,
+    literal: ?[]u8 = null,
+    full_vec: bool = false,
+    json: bool = false,
+
+    pub fn deinit(self: *ClientArgs, allocator: std.mem.Allocator) void {
+        if (self.connect) |p| allocator.free(p);
+        if (self.pos0) |p| allocator.free(p);
+        if (self.pos1) |p| allocator.free(p);
+        if (self.from_file) |p| allocator.free(p);
+        if (self.literal) |p| allocator.free(p);
+        self.* = undefined;
+    }
+};
+
+/// Tagged-union of subcommand-specific arg bundles. Callers switch on
+/// `args.command` and receive a typed pointer to the active variant —
+/// no more "did this flag apply to benchmark or client?" ambiguity.
+pub const Command = union(Subcommand) {
+    build: BuildArgs,
+    query: QueryArgs,
+    benchmark: BenchArgs,
+    serve: ServeArgs,
+    client: ClientArgs,
+
+    pub fn deinit(self: *Command, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*v| v.deinit(allocator),
+        }
+    }
+};
+
+/// Parsed command-line arguments. `config_path` is shared across all
+/// subcommands (they all accept `--config` + `HNSWZ_CONFIG`); everything
+/// else lives on the active `command` variant.
+///
+/// `config_path` is optional because `benchmark` runs fine without one
+/// (it has its own defaults). `build` and `serve` enforce presence at
+/// dispatch time in main.zig.
+pub const Args = struct {
+    config_path: ?[]u8 = null,
+    command: Command,
+
+    pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
+        if (self.config_path) |p| allocator.free(p);
+        self.command.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Errors `parse` can surface. `HelpRequested` is modelled as an error so
+/// `parse` stays a pure function; `parseOrExit` turns it into a normal
+/// `exit(0)` with usage printed.
 pub const ParseError = error{
     HelpRequested,
     MissingValue,
@@ -140,313 +191,103 @@ pub const ParseError = error{
     MissingClientVerb,
 } || std.mem.Allocator.Error || std.process.GetEnvVarOwnedError;
 
-/// Parse the current process's argv. Convenience wrapper over `parseFromIter`
-/// that consumes the program name and delegates to the pure parser.
-pub fn parse(allocator: std.mem.Allocator) ParseError!Args {
-    var it = std.process.args();
-    _ = it.next(); // drop argv[0]
-    return parseFromIter(allocator, &it);
+fn takeFlag(arg: []const u8, comptime long: []const u8) bool {
+    return std.mem.eql(u8, arg, long);
 }
 
-/// Pure argument parser. Takes anything that exposes `fn next(*@This()) ?[]const u8`
-/// (or a null-terminated variant — both `std.process.ArgIterator` and the
-/// test `SliceIter` below satisfy this). The caller is expected to have
-/// already consumed the program name.
-pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args {
-    var subcommand: ?Subcommand = null;
-    var config_path: ?[]u8 = null;
-    var source_dir: ?[]u8 = null;
-    var top_k: ?usize = null;
-
-    var bench_num_vectors: ?usize = null;
-    var bench_num_queries: ?usize = null;
-    var bench_dim: ?usize = null;
-    var bench_ef_construction: ?usize = null;
-    var bench_ef_search: ?usize = null;
-    var bench_seed: ?u64 = null;
-    var bench_warmup: ?usize = null;
-    var bench_validate = false;
-    var bench_json = false;
-    var bench_transport: ?BenchTransport = null;
-    var bench_protocol = false;
-    var bench_concurrent_clients: ?usize = null;
-    var bench_server_workers: ?usize = null;
-    var bench_dataset: ?[]u8 = null;
-
-    var serve_listen: ?[]u8 = null;
-    var serve_auto_snapshot_secs: ?u32 = null;
-    var serve_max_connections: ?u32 = null;
-    var serve_max_frame_bytes: ?usize = null;
-    var serve_idle_timeout_secs: ?u32 = null;
-    var serve_n_workers: ?usize = null;
-
-    var client_verb: ?ClientVerb = null;
-    var client_connect: ?[]u8 = null;
-    var client_pos0: ?[]u8 = null;
-    var client_pos1: ?[]u8 = null;
-    var client_dim: ?usize = null;
-    var client_ef: ?u32 = null;
-    var client_from_file: ?[]u8 = null;
-    var client_from_stdin = false;
-    var client_literal: ?[]u8 = null;
-    var client_full_vec = false;
-    var client_json = false;
-
-    errdefer {
-        if (config_path) |p| allocator.free(p);
-        if (source_dir) |p| allocator.free(p);
-        if (serve_listen) |p| allocator.free(p);
-        if (client_connect) |p| allocator.free(p);
-        if (client_pos0) |p| allocator.free(p);
-        if (client_pos1) |p| allocator.free(p);
-        if (client_from_file) |p| allocator.free(p);
-        if (client_literal) |p| allocator.free(p);
-        if (bench_dataset) |p| allocator.free(p);
+/// Returns the raw (non-duped) value slice for `--long <v>` or `--long=v`.
+fn takeRaw(
+    it: anytype,
+    arg: []const u8,
+    comptime long: []const u8,
+) ParseError!?[]const u8 {
+    if (std.mem.eql(u8, arg, long)) {
+        return it.next() orelse return error.MissingValue;
     }
-
-    while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            return error.HelpRequested;
-        } else if (std.mem.eql(u8, arg, "--config")) {
-            const p = it.next() orelse return error.MissingValue;
-            if (config_path) |old| allocator.free(old);
-            config_path = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--config=")) {
-            if (config_path) |old| allocator.free(old);
-            config_path = try allocator.dupe(u8, arg["--config=".len..]);
-        } else if (std.mem.eql(u8, arg, "--source")) {
-            const p = it.next() orelse return error.MissingValue;
-            if (source_dir) |old| allocator.free(old);
-            source_dir = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--source=")) {
-            if (source_dir) |old| allocator.free(old);
-            source_dir = try allocator.dupe(u8, arg["--source=".len..]);
-        } else if (std.mem.eql(u8, arg, "-k") or std.mem.eql(u8, arg, "--top-k")) {
-            const p = it.next() orelse return error.MissingValue;
-            top_k = std.fmt.parseInt(usize, p, 10) catch return error.InvalidTopK;
-        } else if (std.mem.startsWith(u8, arg, "--top-k=")) {
-            top_k = std.fmt.parseInt(usize, arg["--top-k=".len..], 10) catch return error.InvalidTopK;
-        } else if (std.mem.eql(u8, arg, "--num-vectors")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_num_vectors = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.startsWith(u8, arg, "--num-vectors=")) {
-            bench_num_vectors = parseUsize(arg["--num-vectors=".len..]) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.eql(u8, arg, "--num-queries")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_num_queries = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.startsWith(u8, arg, "--num-queries=")) {
-            bench_num_queries = parseUsize(arg["--num-queries=".len..]) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.eql(u8, arg, "--dim")) {
-            const p = it.next() orelse return error.MissingValue;
-            if (subcommand == .client) {
-                client_dim = parseUsize(p) orelse return error.InvalidClientNumber;
-            } else {
-                bench_dim = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
-            }
-        } else if (std.mem.startsWith(u8, arg, "--dim=")) {
-            const v = arg["--dim=".len..];
-            if (subcommand == .client) {
-                client_dim = parseUsize(v) orelse return error.InvalidClientNumber;
-            } else {
-                bench_dim = parseUsize(v) orelse return error.InvalidBenchmarkNumber;
-            }
-        } else if (std.mem.eql(u8, arg, "--ef-construction")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_ef_construction = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.startsWith(u8, arg, "--ef-construction=")) {
-            bench_ef_construction = parseUsize(arg["--ef-construction=".len..]) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.eql(u8, arg, "--ef-search")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_ef_search = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.startsWith(u8, arg, "--ef-search=")) {
-            bench_ef_search = parseUsize(arg["--ef-search=".len..]) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.eql(u8, arg, "--seed")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_seed = std.fmt.parseInt(u64, p, 10) catch return error.InvalidBenchmarkNumber;
-        } else if (std.mem.startsWith(u8, arg, "--seed=")) {
-            bench_seed = std.fmt.parseInt(u64, arg["--seed=".len..], 10) catch return error.InvalidBenchmarkNumber;
-        } else if (std.mem.eql(u8, arg, "--warmup")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_warmup = std.fmt.parseInt(usize, p, 10) catch return error.InvalidBenchmarkNumber;
-        } else if (std.mem.startsWith(u8, arg, "--warmup=")) {
-            bench_warmup = std.fmt.parseInt(usize, arg["--warmup=".len..], 10) catch return error.InvalidBenchmarkNumber;
-        } else if (std.mem.eql(u8, arg, "--validate")) {
-            bench_validate = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            // Both benchmark and client honor --json; only one is live per
-            // invocation so setting both fields is harmless.
-            bench_json = true;
-            client_json = true;
-        } else if (std.mem.eql(u8, arg, "--transport")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_transport = try parseBenchTransport(p);
-        } else if (std.mem.startsWith(u8, arg, "--transport=")) {
-            bench_transport = try parseBenchTransport(arg["--transport=".len..]);
-        } else if (std.mem.eql(u8, arg, "--bench-protocol")) {
-            bench_protocol = true;
-        } else if (std.mem.eql(u8, arg, "--concurrent-clients")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_concurrent_clients = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.startsWith(u8, arg, "--concurrent-clients=")) {
-            bench_concurrent_clients = parseUsize(arg["--concurrent-clients=".len..]) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.eql(u8, arg, "--server-workers")) {
-            const p = it.next() orelse return error.MissingValue;
-            bench_server_workers = parseUsize(p) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.startsWith(u8, arg, "--server-workers=")) {
-            bench_server_workers = parseUsize(arg["--server-workers=".len..]) orelse return error.InvalidBenchmarkNumber;
-        } else if (std.mem.eql(u8, arg, "--dataset")) {
-            const p = it.next() orelse return error.MissingValue;
-            if (bench_dataset) |old| allocator.free(old);
-            bench_dataset = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--dataset=")) {
-            if (bench_dataset) |old| allocator.free(old);
-            bench_dataset = try allocator.dupe(u8, arg["--dataset=".len..]);
-        } else if (std.mem.eql(u8, arg, "--listen")) {
-            const p = it.next() orelse return error.MissingValue;
-            if (serve_listen) |old| allocator.free(old);
-            serve_listen = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--listen=")) {
-            if (serve_listen) |old| allocator.free(old);
-            serve_listen = try allocator.dupe(u8, arg["--listen=".len..]);
-        } else if (std.mem.eql(u8, arg, "--auto-snapshot-secs")) {
-            const p = it.next() orelse return error.MissingValue;
-            serve_auto_snapshot_secs = std.fmt.parseInt(u32, p, 10) catch return error.InvalidServeNumber;
-        } else if (std.mem.startsWith(u8, arg, "--auto-snapshot-secs=")) {
-            serve_auto_snapshot_secs = std.fmt.parseInt(u32, arg["--auto-snapshot-secs=".len..], 10) catch return error.InvalidServeNumber;
-        } else if (std.mem.eql(u8, arg, "--max-connections")) {
-            const p = it.next() orelse return error.MissingValue;
-            serve_max_connections = std.fmt.parseInt(u32, p, 10) catch return error.InvalidServeNumber;
-        } else if (std.mem.startsWith(u8, arg, "--max-connections=")) {
-            serve_max_connections = std.fmt.parseInt(u32, arg["--max-connections=".len..], 10) catch return error.InvalidServeNumber;
-        } else if (std.mem.eql(u8, arg, "--max-frame-bytes")) {
-            const p = it.next() orelse return error.MissingValue;
-            serve_max_frame_bytes = parseUsize(p) orelse return error.InvalidServeNumber;
-        } else if (std.mem.startsWith(u8, arg, "--max-frame-bytes=")) {
-            serve_max_frame_bytes = parseUsize(arg["--max-frame-bytes=".len..]) orelse return error.InvalidServeNumber;
-        } else if (std.mem.eql(u8, arg, "--idle-timeout-secs")) {
-            const p = it.next() orelse return error.MissingValue;
-            serve_idle_timeout_secs = std.fmt.parseInt(u32, p, 10) catch return error.InvalidServeNumber;
-        } else if (std.mem.startsWith(u8, arg, "--idle-timeout-secs=")) {
-            serve_idle_timeout_secs = std.fmt.parseInt(u32, arg["--idle-timeout-secs=".len..], 10) catch return error.InvalidServeNumber;
-        } else if (std.mem.eql(u8, arg, "--n-workers") or std.mem.eql(u8, arg, "--workers")) {
-            const p = it.next() orelse return error.MissingValue;
-            serve_n_workers = parseUsize(p) orelse return error.InvalidServeNumber;
-        } else if (std.mem.startsWith(u8, arg, "--n-workers=")) {
-            serve_n_workers = parseUsize(arg["--n-workers=".len..]) orelse return error.InvalidServeNumber;
-        } else if (std.mem.startsWith(u8, arg, "--workers=")) {
-            serve_n_workers = parseUsize(arg["--workers=".len..]) orelse return error.InvalidServeNumber;
-        } else if (std.mem.eql(u8, arg, "--connect")) {
-            const p = it.next() orelse return error.MissingValue;
-            if (client_connect) |old| allocator.free(old);
-            client_connect = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--connect=")) {
-            if (client_connect) |old| allocator.free(old);
-            client_connect = try allocator.dupe(u8, arg["--connect=".len..]);
-        } else if (std.mem.eql(u8, arg, "--ef")) {
-            const p = it.next() orelse return error.MissingValue;
-            client_ef = std.fmt.parseInt(u32, p, 10) catch return error.InvalidClientNumber;
-        } else if (std.mem.startsWith(u8, arg, "--ef=")) {
-            client_ef = std.fmt.parseInt(u32, arg["--ef=".len..], 10) catch return error.InvalidClientNumber;
-        } else if (std.mem.eql(u8, arg, "--from-file")) {
-            const p = it.next() orelse return error.MissingValue;
-            if (client_from_file) |old| allocator.free(old);
-            client_from_file = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--from-file=")) {
-            if (client_from_file) |old| allocator.free(old);
-            client_from_file = try allocator.dupe(u8, arg["--from-file=".len..]);
-        } else if (std.mem.eql(u8, arg, "--from-stdin")) {
-            client_from_stdin = true;
-        } else if (std.mem.eql(u8, arg, "--literal")) {
-            const p = it.next() orelse return error.MissingValue;
-            if (client_literal) |old| allocator.free(old);
-            client_literal = try allocator.dupe(u8, p);
-        } else if (std.mem.startsWith(u8, arg, "--literal=")) {
-            if (client_literal) |old| allocator.free(old);
-            client_literal = try allocator.dupe(u8, arg["--literal=".len..]);
-        } else if (std.mem.eql(u8, arg, "--full-vec")) {
-            client_full_vec = true;
-        } else if (subcommand == null and !std.mem.startsWith(u8, arg, "-")) {
-            if (std.mem.eql(u8, arg, "build")) {
-                subcommand = .build;
-            } else if (std.mem.eql(u8, arg, "query")) {
-                subcommand = .query;
-            } else if (std.mem.eql(u8, arg, "benchmark")) {
-                subcommand = .benchmark;
-            } else if (std.mem.eql(u8, arg, "serve")) {
-                subcommand = .serve;
-            } else if (std.mem.eql(u8, arg, "client")) {
-                subcommand = .client;
-            } else {
-                return error.UnknownSubcommand;
-            }
-        } else if (subcommand == .client and client_verb == null and !std.mem.startsWith(u8, arg, "-")) {
-            client_verb = parseClientVerb(arg) orelse return error.InvalidClientVerb;
-        } else if (subcommand == .client and !std.mem.startsWith(u8, arg, "-")) {
-            // Positional arg for the active verb. No verb takes more than 2.
-            if (client_pos0 == null) {
-                client_pos0 = try allocator.dupe(u8, arg);
-            } else if (client_pos1 == null) {
-                client_pos1 = try allocator.dupe(u8, arg);
-            } else {
-                return error.TooManyClientPositionals;
-            }
-        } else {
-            return error.UnknownArgument;
-        }
+    if (std.mem.startsWith(u8, arg, long ++ "=")) {
+        return arg[long.len + 1 ..];
     }
-
-    // Fall back to the env var if --config was not given.
-    if (config_path == null) {
-        config_path = std.process.getEnvVarOwned(allocator, CONFIG_ENV_VAR) catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => null,
-            else => return err,
-        };
-    }
-    if (subcommand == null) return error.MissingSubcommand;
-    // config_path requirement is enforced at dispatch time (benchmark doesn't need one).
-    if (top_k) |k| if (k == 0) return error.TopKZero;
-
-    return .{
-        .subcommand = subcommand.?,
-        .config_path = config_path,
-        .source_dir = source_dir,
-        .top_k = top_k,
-        .bench_num_vectors = bench_num_vectors,
-        .bench_num_queries = bench_num_queries,
-        .bench_dim = bench_dim,
-        .bench_ef_construction = bench_ef_construction,
-        .bench_ef_search = bench_ef_search,
-        .bench_seed = bench_seed,
-        .bench_warmup = bench_warmup,
-        .bench_validate = bench_validate,
-        .bench_json = bench_json,
-        .bench_transport = bench_transport,
-        .bench_protocol = bench_protocol,
-        .bench_concurrent_clients = bench_concurrent_clients,
-        .bench_server_workers = bench_server_workers,
-        .bench_dataset = bench_dataset,
-        .serve_listen = serve_listen,
-        .serve_auto_snapshot_secs = serve_auto_snapshot_secs,
-        .serve_max_connections = serve_max_connections,
-        .serve_max_frame_bytes = serve_max_frame_bytes,
-        .serve_idle_timeout_secs = serve_idle_timeout_secs,
-        .serve_n_workers = serve_n_workers,
-        .client_verb = client_verb,
-        .client_connect = client_connect,
-        .client_pos0 = client_pos0,
-        .client_pos1 = client_pos1,
-        .client_dim = client_dim,
-        .client_ef = client_ef,
-        .client_from_file = client_from_file,
-        .client_from_stdin = client_from_stdin,
-        .client_literal = client_literal,
-        .client_full_vec = client_full_vec,
-        .client_json = client_json,
-    };
+    return null;
 }
 
-fn parseUsize(s: []const u8) ?usize {
-    return std.fmt.parseInt(usize, s, 10) catch null;
+/// Like `takeRaw` but also matches a short alias (e.g. `-k` for `--top-k`).
+fn takeRawEither(
+    it: anytype,
+    arg: []const u8,
+    comptime long: []const u8,
+    comptime short: []const u8,
+) ParseError!?[]const u8 {
+    if (std.mem.eql(u8, arg, short)) {
+        return it.next() orelse return error.MissingValue;
+    }
+    return takeRaw(it, arg, long);
+}
+
+/// Dup `--long`'s value into `slot`, freeing any previous contents so
+/// "last one wins" doesn't leak. Returns `true` if `arg` was consumed.
+fn takeStrInto(
+    allocator: std.mem.Allocator,
+    slot: *?[]u8,
+    it: anytype,
+    arg: []const u8,
+    comptime long: []const u8,
+) ParseError!bool {
+    const raw = (try takeRaw(it, arg, long)) orelse return false;
+    const dup = try allocator.dupe(u8, raw);
+    if (slot.*) |old| allocator.free(old);
+    slot.* = dup;
+    return true;
+}
+
+/// Parse `--long` / `--long=` as integer `T`. Returns null if unmatched;
+/// raises `parse_err` on malformed input so callers get named errors like
+/// `InvalidBenchmarkNumber` at the exact flag site.
+fn takeInt(
+    comptime T: type,
+    it: anytype,
+    arg: []const u8,
+    comptime long: []const u8,
+    parse_err: ParseError,
+) ParseError!?T {
+    const raw = (try takeRaw(it, arg, long)) orelse return null;
+    return std.fmt.parseInt(T, raw, 10) catch return parse_err;
+}
+
+/// Like `takeInt` but with a short alias too.
+fn takeIntEither(
+    comptime T: type,
+    it: anytype,
+    arg: []const u8,
+    comptime long: []const u8,
+    comptime short: []const u8,
+    parse_err: ParseError,
+) ParseError!?T {
+    const raw = (try takeRawEither(it, arg, long, short)) orelse return null;
+    return std.fmt.parseInt(T, raw, 10) catch return parse_err;
+}
+
+fn parseSubcommand(arg: []const u8) ?Subcommand {
+    if (std.mem.eql(u8, arg, "build")) return .build;
+    if (std.mem.eql(u8, arg, "query")) return .query;
+    if (std.mem.eql(u8, arg, "benchmark")) return .benchmark;
+    if (std.mem.eql(u8, arg, "serve")) return .serve;
+    if (std.mem.eql(u8, arg, "client")) return .client;
+    return null;
+}
+
+fn parseClientVerb(arg: []const u8) ?ClientVerb {
+    if (std.mem.eql(u8, arg, "ping")) return .ping;
+    if (std.mem.eql(u8, arg, "stats")) return .stats;
+    if (std.mem.eql(u8, arg, "snapshot")) return .snapshot;
+    if (std.mem.eql(u8, arg, "delete")) return .delete;
+    if (std.mem.eql(u8, arg, "get")) return .get;
+    if (std.mem.eql(u8, arg, "insert-text")) return .insert_text;
+    if (std.mem.eql(u8, arg, "insert-vec")) return .insert_vec;
+    if (std.mem.eql(u8, arg, "replace-text")) return .replace_text;
+    if (std.mem.eql(u8, arg, "replace-vec")) return .replace_vec;
+    if (std.mem.eql(u8, arg, "search-text")) return .search_text;
+    if (std.mem.eql(u8, arg, "search-vec")) return .search_vec;
+    return null;
 }
 
 fn parseBenchTransport(s: []const u8) ParseError!BenchTransport {
@@ -455,19 +296,242 @@ fn parseBenchTransport(s: []const u8) ParseError!BenchTransport {
     return error.InvalidBenchmarkTransport;
 }
 
-fn parseClientVerb(s: []const u8) ?ClientVerb {
-    if (std.mem.eql(u8, s, "ping")) return .ping;
-    if (std.mem.eql(u8, s, "stats")) return .stats;
-    if (std.mem.eql(u8, s, "snapshot")) return .snapshot;
-    if (std.mem.eql(u8, s, "delete")) return .delete;
-    if (std.mem.eql(u8, s, "get")) return .get;
-    if (std.mem.eql(u8, s, "insert-text")) return .insert_text;
-    if (std.mem.eql(u8, s, "insert-vec")) return .insert_vec;
-    if (std.mem.eql(u8, s, "replace-text")) return .replace_text;
-    if (std.mem.eql(u8, s, "replace-vec")) return .replace_vec;
-    if (std.mem.eql(u8, s, "search-text")) return .search_text;
-    if (std.mem.eql(u8, s, "search-vec")) return .search_vec;
-    return null;
+/// Fall back to `$HNSWZ_CONFIG` when `--config` wasn't supplied. Only the
+/// subcommands that actually consume config (build / benchmark / serve)
+/// call this; query and client ignore config and reject `--config` as an
+/// unknown argument.
+fn resolveConfigEnv(allocator: std.mem.Allocator, config_path: *?[]u8) ParseError!void {
+    if (config_path.* != null) return;
+    config_path.* = std.process.getEnvVarOwned(allocator, CONFIG_ENV_VAR) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+}
+
+fn parseBuildArgs(
+    allocator: std.mem.Allocator,
+    it: anytype,
+    config_path: *?[]u8,
+) ParseError!BuildArgs {
+    var out: BuildArgs = .{};
+    errdefer out.deinit(allocator);
+
+    while (it.next()) |arg| {
+        if (takeFlag(arg, "-h") or takeFlag(arg, "--help")) {
+            return error.HelpRequested;
+        } else if (try takeStrInto(allocator, config_path, it, arg, "--config")) {
+            // consumed
+        } else if (try takeStrInto(allocator, &out.source_dir, it, arg, "--source")) {
+            // consumed
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    try resolveConfigEnv(allocator, config_path);
+    return out;
+}
+
+fn parseQueryArgs(
+    allocator: std.mem.Allocator,
+    it: anytype,
+) ParseError!QueryArgs {
+    var out: QueryArgs = .{};
+    errdefer out.deinit(allocator);
+
+    while (it.next()) |arg| {
+        if (takeFlag(arg, "-h") or takeFlag(arg, "--help")) {
+            return error.HelpRequested;
+        } else if (try takeStrInto(allocator, &out.connect, it, arg, "--connect")) {
+            // consumed
+        } else if (try takeIntEither(usize, it, arg, "--top-k", "-k", error.InvalidTopK)) |v| {
+            if (v == 0) return error.TopKZero;
+            out.top_k = v;
+        } else if (try takeInt(u32, it, arg, "--ef", error.InvalidClientNumber)) |v| {
+            out.ef = v;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    return out;
+}
+
+fn parseBenchArgs(
+    allocator: std.mem.Allocator,
+    it: anytype,
+    config_path: *?[]u8,
+) ParseError!BenchArgs {
+    var out: BenchArgs = .{};
+    errdefer out.deinit(allocator);
+
+    while (it.next()) |arg| {
+        if (takeFlag(arg, "-h") or takeFlag(arg, "--help")) {
+            return error.HelpRequested;
+        } else if (try takeStrInto(allocator, config_path, it, arg, "--config")) {
+            // consumed
+        } else if (try takeInt(usize, it, arg, "--num-vectors", error.InvalidBenchmarkNumber)) |v| {
+            out.num_vectors = v;
+        } else if (try takeInt(usize, it, arg, "--num-queries", error.InvalidBenchmarkNumber)) |v| {
+            out.num_queries = v;
+        } else if (try takeInt(usize, it, arg, "--dim", error.InvalidBenchmarkNumber)) |v| {
+            out.dim = v;
+        } else if (try takeInt(usize, it, arg, "--ef-construction", error.InvalidBenchmarkNumber)) |v| {
+            out.ef_construction = v;
+        } else if (try takeInt(usize, it, arg, "--ef-search", error.InvalidBenchmarkNumber)) |v| {
+            out.ef_search = v;
+        } else if (try takeInt(u64, it, arg, "--seed", error.InvalidBenchmarkNumber)) |v| {
+            out.seed = v;
+        } else if (try takeInt(usize, it, arg, "--warmup", error.InvalidBenchmarkNumber)) |v| {
+            out.warmup = v;
+        } else if (try takeIntEither(usize, it, arg, "--top-k", "-k", error.InvalidTopK)) |v| {
+            if (v == 0) return error.TopKZero;
+            out.top_k = v;
+        } else if (takeFlag(arg, "--validate")) {
+            out.validate = true;
+        } else if (takeFlag(arg, "--json")) {
+            out.json = true;
+        } else if (try takeRaw(it, arg, "--transport")) |raw| {
+            out.transport = try parseBenchTransport(raw);
+        } else if (takeFlag(arg, "--bench-protocol")) {
+            out.bench_protocol = true;
+        } else if (try takeInt(usize, it, arg, "--concurrent-clients", error.InvalidBenchmarkNumber)) |v| {
+            out.concurrent_clients = v;
+        } else if (try takeInt(usize, it, arg, "--server-workers", error.InvalidBenchmarkNumber)) |v| {
+            out.server_workers = v;
+        } else if (try takeStrInto(allocator, &out.dataset, it, arg, "--dataset")) {
+            // consumed
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    try resolveConfigEnv(allocator, config_path);
+    return out;
+}
+
+fn parseServeArgs(
+    allocator: std.mem.Allocator,
+    it: anytype,
+    config_path: *?[]u8,
+) ParseError!ServeArgs {
+    var out: ServeArgs = .{};
+    errdefer out.deinit(allocator);
+
+    while (it.next()) |arg| {
+        if (takeFlag(arg, "-h") or takeFlag(arg, "--help")) {
+            return error.HelpRequested;
+        } else if (try takeStrInto(allocator, config_path, it, arg, "--config")) {
+            // consumed
+        } else if (try takeStrInto(allocator, &out.listen, it, arg, "--listen")) {
+            // consumed
+        } else if (try takeInt(u32, it, arg, "--auto-snapshot-secs", error.InvalidServeNumber)) |v| {
+            out.auto_snapshot_secs = v;
+        } else if (try takeInt(u32, it, arg, "--max-connections", error.InvalidServeNumber)) |v| {
+            out.max_connections = v;
+        } else if (try takeInt(usize, it, arg, "--max-frame-bytes", error.InvalidServeNumber)) |v| {
+            out.max_frame_bytes = v;
+        } else if (try takeInt(u32, it, arg, "--idle-timeout-secs", error.InvalidServeNumber)) |v| {
+            out.idle_timeout_secs = v;
+        } else if (try takeInt(usize, it, arg, "--n-workers", error.InvalidServeNumber)) |v| {
+            out.n_workers = v;
+        } else if (try takeInt(usize, it, arg, "--workers", error.InvalidServeNumber)) |v| {
+            out.n_workers = v;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    try resolveConfigEnv(allocator, config_path);
+    return out;
+}
+
+fn parseClientArgs(
+    allocator: std.mem.Allocator,
+    it: anytype,
+) ParseError!ClientArgs {
+    var out: ClientArgs = .{};
+    errdefer out.deinit(allocator);
+
+    while (it.next()) |arg| {
+        if (takeFlag(arg, "-h") or takeFlag(arg, "--help")) {
+            return error.HelpRequested;
+        } else if (try takeStrInto(allocator, &out.connect, it, arg, "--connect")) {
+            // consumed
+        } else if (try takeIntEither(usize, it, arg, "--top-k", "-k", error.InvalidTopK)) |v| {
+            if (v == 0) return error.TopKZero;
+            out.top_k = v;
+        } else if (try takeInt(u32, it, arg, "--ef", error.InvalidClientNumber)) |v| {
+            out.ef = v;
+        } else if (try takeInt(usize, it, arg, "--dim", error.InvalidClientNumber)) |v| {
+            out.dim = v;
+        } else if (try takeStrInto(allocator, &out.from_file, it, arg, "--from-file")) {
+            // consumed
+        } else if (takeFlag(arg, "--from-stdin")) {
+            out.from_stdin = true;
+        } else if (try takeStrInto(allocator, &out.literal, it, arg, "--literal")) {
+            // consumed
+        } else if (takeFlag(arg, "--full-vec")) {
+            out.full_vec = true;
+        } else if (takeFlag(arg, "--json")) {
+            out.json = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            // Positional: verb first, then verb-specific args.
+            if (out.verb == null) {
+                out.verb = parseClientVerb(arg) orelse return error.InvalidClientVerb;
+            } else if (out.pos0 == null) {
+                out.pos0 = try allocator.dupe(u8, arg);
+            } else if (out.pos1 == null) {
+                out.pos1 = try allocator.dupe(u8, arg);
+            } else {
+                return error.TooManyClientPositionals;
+            }
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    return out;
+}
+
+/// Parse the current process's argv. Convenience wrapper over `parseFromIter`.
+pub fn parse(allocator: std.mem.Allocator) ParseError!Args {
+    var it = std.process.args();
+    _ = it.next(); // drop argv[0]
+    return parseFromIter(allocator, &it);
+}
+
+/// Pure argument parser. Takes anything that exposes
+/// `fn next(*@This()) ?[]const u8`. Both `std.process.ArgIterator` and the
+/// test `SliceIter` satisfy this. Program name must already be consumed.
+pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args {
+    var config_path: ?[]u8 = null;
+    errdefer if (config_path) |p| allocator.free(p);
+
+    // Phase 1: the only universal pre-subcommand flag is --help. --config
+    // is subcommand-local so `hnswz query --config x` and
+    // `hnswz --config x query` both error (query doesn't accept config).
+    var subcommand: ?Subcommand = null;
+    while (it.next()) |arg| {
+        if (takeFlag(arg, "-h") or takeFlag(arg, "--help")) {
+            return error.HelpRequested;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            subcommand = parseSubcommand(arg) orelse return error.UnknownSubcommand;
+            break;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+
+    const sub = subcommand orelse return error.MissingSubcommand;
+
+    // Phase 2: hand the rest of argv to the matching sub-parser. Parsers
+    // that consume config (build/benchmark/serve) resolve HNSWZ_CONFIG
+    // themselves; the others don't see config_path at all.
+    const command: Command = switch (sub) {
+        .build => .{ .build = try parseBuildArgs(allocator, it, &config_path) },
+        .query => .{ .query = try parseQueryArgs(allocator, it) },
+        .benchmark => .{ .benchmark = try parseBenchArgs(allocator, it, &config_path) },
+        .serve => .{ .serve = try parseServeArgs(allocator, it, &config_path) },
+        .client => .{ .client = try parseClientArgs(allocator, it) },
+    };
+
+    return .{ .config_path = config_path, .command = command };
 }
 
 /// Emit the usage text to stdout.
@@ -578,15 +642,15 @@ pub fn printUsage() !void {
     try w.flush();
 }
 
-/// Human-readable explanation for a `ParseError`. `--help` is intentionally
-/// excluded — the caller handles it separately (exit 0, not exit 2).
+/// Human-readable explanation for a `ParseError`. `HelpRequested` is
+/// intentionally excluded — the caller handles it separately (exit 0).
 fn describeParseError(err: ParseError) []const u8 {
     return switch (err) {
         error.MissingValue => "flag requires a value",
         error.UnknownArgument => "unknown argument",
-        error.UnknownSubcommand => "unknown subcommand (expected 'build', 'query', 'benchmark', or 'serve')",
+        error.UnknownSubcommand => "unknown subcommand (expected 'build', 'query', 'benchmark', 'serve', or 'client')",
         error.MissingConfig => "no config specified (use --config <path> or set " ++ CONFIG_ENV_VAR ++ ")",
-        error.MissingSubcommand => "missing subcommand (build | query | benchmark | serve)",
+        error.MissingSubcommand => "missing subcommand (build | query | benchmark | serve | client)",
         error.TopKZero => "--top-k must be > 0",
         error.InvalidTopK => "--top-k must be a non-negative integer",
         error.InvalidBenchmarkNumber => "benchmark integer flag could not be parsed",
@@ -615,8 +679,6 @@ pub fn parseOrExit(allocator: std.mem.Allocator) Args {
             std.process.exit(0);
         }
 
-        // Include the Zig error name when the mapping is generic so the user
-        // can still tell OutOfMemory from InvalidUtf8 etc.
         switch (err) {
             error.MissingValue,
             error.UnknownArgument,
@@ -641,8 +703,6 @@ pub fn parseOrExit(allocator: std.mem.Allocator) Args {
     };
 }
 
-
-
 const testing = std.testing;
 
 /// Minimal iterator backing so tests don't have to shell out to a child
@@ -664,37 +724,52 @@ test "parse: build with space-separated flags" {
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(Subcommand.build, args.subcommand);
+    try testing.expectEqual(Subcommand.build, std.meta.activeTag(args.command));
     try testing.expectEqualStrings("cfg.json", args.config_path.?);
-    try testing.expectEqualStrings("./docs", args.source_dir.?);
-    try testing.expect(args.top_k == null);
+    try testing.expectEqualStrings("./docs", args.command.build.source_dir.?);
 }
 
 test "parse: query with equals-form flags and custom top-k" {
-    var it: SliceIter = .{ .slice = &.{ "query", "--config=cfg.json", "--top-k=42" } };
+    var it: SliceIter = .{ .slice = &.{ "query", "--top-k=42" } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(Subcommand.query, args.subcommand);
-    try testing.expectEqualStrings("cfg.json", args.config_path.?);
-    try testing.expect(args.source_dir == null);
-    try testing.expectEqual(@as(usize, 42), args.top_k.?);
+    try testing.expectEqual(Subcommand.query, std.meta.activeTag(args.command));
+    try testing.expect(args.config_path == null);
+    try testing.expectEqual(@as(usize, 42), args.command.query.top_k.?);
 }
 
 test "parse: -k short form" {
-    var it: SliceIter = .{ .slice = &.{ "query", "--config", "c.json", "-k", "7" } };
+    var it: SliceIter = .{ .slice = &.{ "query", "-k", "7" } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 7), args.top_k.?);
+    try testing.expectEqual(@as(usize, 7), args.command.query.top_k.?);
 }
 
 test "parse: later --config overrides earlier and does not leak" {
-    var it: SliceIter = .{ .slice = &.{ "query", "--config", "first.json", "--config=second.json" } };
+    var it: SliceIter = .{ .slice = &.{ "build", "--config", "first.json", "--config=second.json" } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
     try testing.expectEqualStrings("second.json", args.config_path.?);
+}
+
+test "parse: query rejects --config" {
+    var it: SliceIter = .{ .slice = &.{ "query", "--config", "cfg.json" } };
+    try testing.expectError(error.UnknownArgument, parseFromIter(testing.allocator, &it));
+}
+
+test "parse: client rejects --config" {
+    var it: SliceIter = .{ .slice = &.{ "client", "--config", "cfg.json", "ping" } };
+    try testing.expectError(error.UnknownArgument, parseFromIter(testing.allocator, &it));
+}
+
+test "parse: --config before subcommand rejected" {
+    // --config is subcommand-local, so even a legitimate target like
+    // `build` can't sit behind a pre-subcommand --config.
+    var it: SliceIter = .{ .slice = &.{ "--config", "cfg.json", "build" } };
+    try testing.expectError(error.UnknownArgument, parseFromIter(testing.allocator, &it));
 }
 
 test "parse: --help returns HelpRequested" {
@@ -708,27 +783,27 @@ test "parse: -h returns HelpRequested even with other args" {
 }
 
 test "parse: missing subcommand" {
-    var it: SliceIter = .{ .slice = &.{ "--config", "cfg.json" } };
+    var it: SliceIter = .{ .slice = &.{} };
     try testing.expectError(error.MissingSubcommand, parseFromIter(testing.allocator, &it));
 }
 
 test "parse: unknown subcommand" {
-    var it: SliceIter = .{ .slice = &.{ "frobnicate", "--config", "cfg.json" } };
+    var it: SliceIter = .{ .slice = &.{"frobnicate"} };
     try testing.expectError(error.UnknownSubcommand, parseFromIter(testing.allocator, &it));
 }
 
 test "parse: --top-k 0 rejected" {
-    var it: SliceIter = .{ .slice = &.{ "query", "--config", "cfg.json", "--top-k", "0" } };
+    var it: SliceIter = .{ .slice = &.{ "query", "--top-k", "0" } };
     try testing.expectError(error.TopKZero, parseFromIter(testing.allocator, &it));
 }
 
 test "parse: non-numeric --top-k rejected" {
-    var it: SliceIter = .{ .slice = &.{ "query", "--config", "cfg.json", "--top-k", "abc" } };
+    var it: SliceIter = .{ .slice = &.{ "query", "--top-k", "abc" } };
     try testing.expectError(error.InvalidTopK, parseFromIter(testing.allocator, &it));
 }
 
 test "parse: missing value after --config" {
-    var it: SliceIter = .{ .slice = &.{"--config"} };
+    var it: SliceIter = .{ .slice = &.{ "build", "--config" } };
     try testing.expectError(error.MissingValue, parseFromIter(testing.allocator, &it));
 }
 
@@ -747,40 +822,46 @@ test "parse: benchmark with no config succeeds" {
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(Subcommand.benchmark, args.subcommand);
+    try testing.expectEqual(Subcommand.benchmark, std.meta.activeTag(args.command));
     try testing.expect(args.config_path == null);
-    try testing.expect(!args.bench_validate);
-    try testing.expect(!args.bench_json);
+    try testing.expect(!args.command.benchmark.validate);
+    try testing.expect(!args.command.benchmark.json);
 }
 
 test "parse: benchmark with all knobs set" {
     var it: SliceIter = .{ .slice = &.{
         "benchmark",
-        "--num-vectors", "5000",
+        "--num-vectors",
+        "5000",
         "--num-queries=200",
-        "--dim",         "64",
+        "--dim",
+        "64",
         "--ef-construction=150",
-        "--ef-search",   "80",
-        "--top-k",       "10",
+        "--ef-search",
+        "80",
+        "--top-k",
+        "10",
         "--seed=7",
-        "--warmup",      "25",
+        "--warmup",
+        "25",
         "--validate",
         "--json",
     } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(Subcommand.benchmark, args.subcommand);
-    try testing.expectEqual(@as(usize, 5000), args.bench_num_vectors.?);
-    try testing.expectEqual(@as(usize, 200), args.bench_num_queries.?);
-    try testing.expectEqual(@as(usize, 64), args.bench_dim.?);
-    try testing.expectEqual(@as(usize, 150), args.bench_ef_construction.?);
-    try testing.expectEqual(@as(usize, 80), args.bench_ef_search.?);
-    try testing.expectEqual(@as(usize, 10), args.top_k.?);
-    try testing.expectEqual(@as(u64, 7), args.bench_seed.?);
-    try testing.expectEqual(@as(usize, 25), args.bench_warmup.?);
-    try testing.expect(args.bench_validate);
-    try testing.expect(args.bench_json);
+    const b = args.command.benchmark;
+    try testing.expectEqual(Subcommand.benchmark, std.meta.activeTag(args.command));
+    try testing.expectEqual(@as(usize, 5000), b.num_vectors.?);
+    try testing.expectEqual(@as(usize, 200), b.num_queries.?);
+    try testing.expectEqual(@as(usize, 64), b.dim.?);
+    try testing.expectEqual(@as(usize, 150), b.ef_construction.?);
+    try testing.expectEqual(@as(usize, 80), b.ef_search.?);
+    try testing.expectEqual(@as(usize, 10), b.top_k.?);
+    try testing.expectEqual(@as(u64, 7), b.seed.?);
+    try testing.expectEqual(@as(usize, 25), b.warmup.?);
+    try testing.expect(b.validate);
+    try testing.expect(b.json);
 }
 
 test "parse: benchmark with malformed number rejected" {
@@ -796,30 +877,35 @@ test "parse: benchmark --seed=nonnumeric rejected" {
 test "parse: serve with all knobs" {
     var it: SliceIter = .{ .slice = &.{
         "serve",
-        "--config",                "c.json",
-        "--listen",                "0.0.0.0:9999",
+        "--config",
+        "c.json",
+        "--listen",
+        "0.0.0.0:9999",
         "--auto-snapshot-secs=30",
-        "--max-connections",       "128",
+        "--max-connections",
+        "128",
         "--max-frame-bytes=1048576",
-        "--idle-timeout-secs",     "120",
+        "--idle-timeout-secs",
+        "120",
     } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(Subcommand.serve, args.subcommand);
+    const s = args.command.serve;
+    try testing.expectEqual(Subcommand.serve, std.meta.activeTag(args.command));
     try testing.expectEqualStrings("c.json", args.config_path.?);
-    try testing.expectEqualStrings("0.0.0.0:9999", args.serve_listen.?);
-    try testing.expectEqual(@as(u32, 30), args.serve_auto_snapshot_secs.?);
-    try testing.expectEqual(@as(u32, 128), args.serve_max_connections.?);
-    try testing.expectEqual(@as(usize, 1_048_576), args.serve_max_frame_bytes.?);
-    try testing.expectEqual(@as(u32, 120), args.serve_idle_timeout_secs.?);
+    try testing.expectEqualStrings("0.0.0.0:9999", s.listen.?);
+    try testing.expectEqual(@as(u32, 30), s.auto_snapshot_secs.?);
+    try testing.expectEqual(@as(u32, 128), s.max_connections.?);
+    try testing.expectEqual(@as(usize, 1_048_576), s.max_frame_bytes.?);
+    try testing.expectEqual(@as(u32, 120), s.idle_timeout_secs.?);
 }
 
 test "parse: serve equals-form --listen" {
     var it: SliceIter = .{ .slice = &.{ "serve", "--config=c.json", "--listen=127.0.0.1:5000" } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
-    try testing.expectEqualStrings("127.0.0.1:5000", args.serve_listen.?);
+    try testing.expectEqualStrings("127.0.0.1:5000", args.command.serve.listen.?);
 }
 
 test "parse: serve rejects non-numeric snapshot-secs" {
@@ -831,15 +917,15 @@ test "parse: benchmark --transport tcp" {
     var it: SliceIter = .{ .slice = &.{ "benchmark", "--transport", "tcp" } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
-    try testing.expectEqual(BenchTransport.tcp, args.bench_transport.?);
-    try testing.expect(!args.bench_protocol);
+    try testing.expectEqual(BenchTransport.tcp, args.command.benchmark.transport.?);
+    try testing.expect(!args.command.benchmark.bench_protocol);
 }
 
 test "parse: benchmark --transport=in-process" {
     var it: SliceIter = .{ .slice = &.{ "benchmark", "--transport=in-process" } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
-    try testing.expectEqual(BenchTransport.in_process, args.bench_transport.?);
+    try testing.expectEqual(BenchTransport.in_process, args.command.benchmark.transport.?);
 }
 
 test "parse: benchmark --transport rejects unknown" {
@@ -851,7 +937,7 @@ test "parse: benchmark --bench-protocol" {
     var it: SliceIter = .{ .slice = &.{ "benchmark", "--bench-protocol" } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
-    try testing.expect(args.bench_protocol);
+    try testing.expect(args.command.benchmark.bench_protocol);
 }
 
 test "parse: client ping with explicit connect" {
@@ -859,10 +945,11 @@ test "parse: client ping with explicit connect" {
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(Subcommand.client, args.subcommand);
-    try testing.expectEqual(ClientVerb.ping, args.client_verb.?);
-    try testing.expectEqualStrings("127.0.0.1:9000", args.client_connect.?);
-    try testing.expect(args.client_pos0 == null);
+    const c = args.command.client;
+    try testing.expectEqual(Subcommand.client, std.meta.activeTag(args.command));
+    try testing.expectEqual(ClientVerb.ping, c.verb.?);
+    try testing.expectEqualStrings("127.0.0.1:9000", c.connect.?);
+    try testing.expect(c.pos0 == null);
 }
 
 test "parse: client delete with id positional" {
@@ -870,9 +957,9 @@ test "parse: client delete with id positional" {
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(ClientVerb.delete, args.client_verb.?);
-    try testing.expectEqualStrings("42", args.client_pos0.?);
-    try testing.expect(args.client_pos1 == null);
+    try testing.expectEqual(ClientVerb.delete, args.command.client.verb.?);
+    try testing.expectEqualStrings("42", args.command.client.pos0.?);
+    try testing.expect(args.command.client.pos1 == null);
 }
 
 test "parse: client replace-text with id + text positionals" {
@@ -880,23 +967,24 @@ test "parse: client replace-text with id + text positionals" {
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(ClientVerb.replace_text, args.client_verb.?);
-    try testing.expectEqualStrings("7", args.client_pos0.?);
-    try testing.expectEqualStrings("new body", args.client_pos1.?);
+    try testing.expectEqual(ClientVerb.replace_text, args.command.client.verb.?);
+    try testing.expectEqualStrings("7", args.command.client.pos0.?);
+    try testing.expectEqualStrings("new body", args.command.client.pos1.?);
 }
 
 test "parse: client insert-vec with --dim and --literal" {
     var it: SliceIter = .{ .slice = &.{
-        "client",             "insert-vec",
-        "--dim",              "4",
-        "--literal",          "1.0,2.0,3.0,4.0",
+        "client",    "insert-vec",
+        "--dim",     "4",
+        "--literal", "1.0,2.0,3.0,4.0",
     } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(ClientVerb.insert_vec, args.client_verb.?);
-    try testing.expectEqual(@as(usize, 4), args.client_dim.?);
-    try testing.expectEqualStrings("1.0,2.0,3.0,4.0", args.client_literal.?);
+    const c = args.command.client;
+    try testing.expectEqual(ClientVerb.insert_vec, c.verb.?);
+    try testing.expectEqual(@as(usize, 4), c.dim.?);
+    try testing.expectEqualStrings("1.0,2.0,3.0,4.0", c.literal.?);
 }
 
 test "parse: client search-text with top-k and ef" {
@@ -907,17 +995,18 @@ test "parse: client search-text with top-k and ef" {
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
 
-    try testing.expectEqual(ClientVerb.search_text, args.client_verb.?);
-    try testing.expectEqualStrings("foo bar", args.client_pos0.?);
-    try testing.expectEqual(@as(usize, 10), args.top_k.?);
-    try testing.expectEqual(@as(u32, 40), args.client_ef.?);
+    const c = args.command.client;
+    try testing.expectEqual(ClientVerb.search_text, c.verb.?);
+    try testing.expectEqualStrings("foo bar", c.pos0.?);
+    try testing.expectEqual(@as(usize, 10), c.top_k.?);
+    try testing.expectEqual(@as(u32, 40), c.ef.?);
 }
 
 test "parse: client --json flag" {
     var it: SliceIter = .{ .slice = &.{ "client", "stats", "--json" } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
-    try testing.expect(args.client_json);
+    try testing.expect(args.command.client.json);
 }
 
 test "parse: client unknown verb rejected" {
@@ -938,6 +1027,6 @@ test "parse: client --from-file and --from-stdin" {
     } };
     var args = try parseFromIter(testing.allocator, &it);
     defer args.deinit(testing.allocator);
-    try testing.expectEqualStrings("vec.f32", args.client_from_file.?);
-    try testing.expect(!args.client_from_stdin);
+    try testing.expectEqualStrings("vec.f32", args.command.client.from_file.?);
+    try testing.expect(!args.command.client.from_stdin);
 }
