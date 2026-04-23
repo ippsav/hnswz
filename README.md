@@ -77,7 +77,7 @@ Embedding runs through a worker pool so large corpora aren't bottlenecked on a s
 
 | flag | default | description |
 |---|---|---|
-| `--workers <n>` / `--n-workers <n>` | `0` (auto = `min(cpu, 8)`) | embed worker-pool size; each worker owns its own Ollama HTTP client |
+| `--workers <n>` / `--n-workers <n>` | `$OLLAMA_NUM_PARALLEL` if set, else `4` | embed worker-pool size; sized against Ollama's own request-parallelism cap (going higher just queues on the server) |
 
 ### `query` — interactive REPL
 

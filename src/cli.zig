@@ -580,7 +580,8 @@ pub fn printUsage() !void {
         \\                    worker runs an independent Ollama HTTP client
         \\                    in parallel; main thread keeps HNSW insertion
         \\                    strictly in filename-sorted order. Default 0
-        \\                    (auto = min(cpu, 8)). Also accepts --n-workers.
+        \\                    = $OLLAMA_NUM_PARALLEL if set, else 4 (Ollama's
+        \\                    built-in default). Also accepts --n-workers.
         \\  --top-k <n>       (query/benchmark/client) Results per search.
         \\                    Default 5 for query/client, 10 for benchmark.
         \\

@@ -122,20 +122,37 @@ const BuildShared = struct {
     done_cond: std.Thread.Condition = .{},
 };
 
-/// Read + embed one file into `vec`. Used inside the worker loop so the
-/// main `embedWorkerLoop` stays a thin pop/dispatch/signal shell.
+/// Read the file contents into `buf`, returning the populated prefix.
+/// Caps at `buf.len` and returns `error.StreamTooLong` if the file is
+/// longer, matching `readToEndAlloc`'s semantics so the max-text-bytes
+/// guard behaves identically to the pre-parallel code path.
+fn readFileBounded(file: std.fs.File, buf: []u8) ![]u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = try file.read(buf[total..]);
+        if (n == 0) return buf[0..total];
+        total += n;
+    }
+    // Buffer filled exactly; probe for one more byte to disambiguate
+    // "fits exactly" from "truncated".
+    var probe: [1]u8 = undefined;
+    const extra = try file.read(&probe);
+    if (extra != 0) return error.StreamTooLong;
+    return buf[0..total];
+}
+
+/// Read + embed one file into `vec`, using the worker-owned `content_buf`
+/// so no per-file allocation happens on the hot path.
 fn embedOneFile(
-    allocator: std.mem.Allocator,
     embedder: hnswz.Embedder,
     src_dir: std.fs.Dir,
     name: []const u8,
     vec: []f32,
-    max_text_bytes: usize,
+    content_buf: []u8,
 ) !void {
     var file = try src_dir.openFile(name, .{});
     defer file.close();
-    const content = try file.readToEndAlloc(allocator, max_text_bytes);
-    defer allocator.free(content);
+    const content = try readFileBounded(file, content_buf);
     try embedder.embed(content, vec);
 }
 
@@ -146,10 +163,9 @@ fn embedOneFile(
 /// worker so the remaining in-flight slots can still be drained.
 fn embedWorkerLoop(
     shared: *BuildShared,
-    allocator: std.mem.Allocator,
     client: *hnswz.OllamaClient,
     src_dir: std.fs.Dir,
-    max_text_bytes: usize,
+    content_buf: []u8,
 ) void {
     const embedder = client.embedder();
     while (true) {
@@ -165,11 +181,13 @@ fn embedWorkerLoop(
             shared.mutex.unlock();
             return;
         }
-        const slot_idx = shared.jobs.pop().?;
+        // FIFO: take the oldest submission. `jobs.items.len` is bounded
+        // by `n_inflight` (~2× workers) so `orderedRemove(0)` is cheap.
+        const slot_idx = shared.jobs.orderedRemove(0);
         shared.mutex.unlock();
 
         const slot = &shared.slots[slot_idx];
-        const res = embedOneFile(allocator, embedder, src_dir, slot.name, slot.vec, max_text_bytes);
+        const res = embedOneFile(embedder, src_dir, slot.name, slot.vec, content_buf);
 
         shared.mutex.lock();
         if (res) |_| {
@@ -193,13 +211,25 @@ fn printBuildProgress(embeds: usize, inserts: usize, total: usize) void {
     std.debug.print("\rEmbed [{d}/{d}]  Insert [{d}/{d}]   ", .{ embeds, total, inserts, total });
 }
 
-/// Resolve the auto (`0`) worker count to a concrete value. Embedding is
-/// network-bound (HTTP to Ollama), so extra threads past ~8 rarely help
-/// and can swamp a local Ollama with concurrent requests.
+/// Ollama's built-in default for `OLLAMA_NUM_PARALLEL`. Going higher than
+/// whatever Ollama is configured for just queues requests on the server
+/// side with no wall-clock win, so this is the right anchor (not cpu
+/// count — embedding is GPU/server-bound, not client-CPU-bound).
+const OLLAMA_DEFAULT_PARALLEL: usize = 4;
+
+/// Resolve the auto (`0`) worker count to a concrete value. Matches the
+/// effective capacity of the Ollama instance we're pointed at:
+///   1. explicit `--workers` from the CLI always wins,
+///   2. else `OLLAMA_NUM_PARALLEL` from the env,
+///   3. else Ollama's built-in default (4).
 fn resolveBuildWorkers(requested: usize) usize {
     if (requested != 0) return requested;
-    const cpu = std.Thread.getCpuCount() catch 4;
-    return @min(@as(usize, 8), @max(@as(usize, 1), cpu));
+    if (std.posix.getenv("OLLAMA_NUM_PARALLEL")) |raw| {
+        if (std.fmt.parseInt(usize, raw, 10)) |v| {
+            if (v > 0) return v;
+        } else |_| {}
+    }
+    return OLLAMA_DEFAULT_PARALLEL;
 }
 
 fn runBuild(
@@ -341,6 +371,12 @@ fn runBuild(
         clients_inited += 1;
     }
 
+    // Per-worker file-content scratch — one `max_text_bytes` buffer each,
+    // carved out of one flat allocation. Reused across every file the
+    // worker processes so the hot path does no allocator work at all.
+    const content_flat = try allocator.alloc(u8, n_workers * cfg.embedder.max_text_bytes);
+    defer allocator.free(content_flat);
+
     const threads = try allocator.alloc(std.Thread, n_workers);
     defer allocator.free(threads);
     var threads_spawned: usize = 0;
@@ -356,10 +392,11 @@ fn runBuild(
     }
 
     for (threads, 0..) |*t, i| {
+        const content_buf = content_flat[i * cfg.embedder.max_text_bytes ..][0..cfg.embedder.max_text_bytes];
         t.* = try std.Thread.spawn(
             .{},
             embedWorkerLoop,
-            .{ &shared, allocator, &clients[i], src_dir, cfg.embedder.max_text_bytes },
+            .{ &shared, &clients[i], src_dir, content_buf },
         );
         threads_spawned += 1;
     }
