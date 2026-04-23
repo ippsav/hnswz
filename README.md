@@ -70,8 +70,14 @@ Five subcommands: `build`, `query`, `benchmark`, `serve`, `client`.
 Embeds every `.txt` file in `<dir>` via Ollama, builds the HNSW graph, and writes vectors, graph, and filename metadata into `storage.data_dir`.
 
 ```sh
-hnswz build --config config.json --source ./docs
+hnswz build --config config.json --source ./docs [--workers N]
 ```
+
+Embedding runs through a worker pool so large corpora aren't bottlenecked on a single synchronous HTTP round-trip per file. Main thread keeps HNSW insertion strictly in filename-sorted order so ids remain deterministic.
+
+| flag | default | description |
+|---|---|---|
+| `--workers <n>` / `--n-workers <n>` | `0` (auto = `min(cpu, 8)`) | embed worker-pool size; each worker owns its own Ollama HTTP client |
 
 ### `query` — interactive REPL
 

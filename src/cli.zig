@@ -41,6 +41,10 @@ pub const ClientVerb = enum {
 
 pub const BuildArgs = struct {
     source_dir: ?[]u8 = null,
+    /// Embedding worker-pool size. Each worker owns its own Ollama HTTP
+    /// client and embeds a distinct file in parallel, while main keeps
+    /// the HNSW insert path single-threaded. 0 (or unset) = auto.
+    n_workers: ?usize = null,
 
     pub fn deinit(self: *BuildArgs, allocator: std.mem.Allocator) void {
         if (self.source_dir) |p| allocator.free(p);
@@ -184,6 +188,7 @@ pub const ParseError = error{
     InvalidTopK,
     InvalidBenchmarkNumber,
     InvalidBenchmarkTransport,
+    InvalidBuildNumber,
     InvalidServeNumber,
     InvalidClientVerb,
     InvalidClientNumber,
@@ -323,6 +328,10 @@ fn parseBuildArgs(
             // consumed
         } else if (try takeStrInto(allocator, &out.source_dir, it, arg, "--source")) {
             // consumed
+        } else if (try takeInt(usize, it, arg, "--workers", error.InvalidBuildNumber)) |v| {
+            out.n_workers = v;
+        } else if (try takeInt(usize, it, arg, "--n-workers", error.InvalidBuildNumber)) |v| {
+            out.n_workers = v;
         } else {
             return error.UnknownArgument;
         }
@@ -538,7 +547,7 @@ pub fn parseFromIter(allocator: std.mem.Allocator, it: anytype) ParseError!Args 
 pub fn printUsage() !void {
     const usage =
         \\Usage:
-        \\  hnswz build      --config <path> --source <dir>
+        \\  hnswz build      --config <path> --source <dir> [--workers <n>]
         \\  hnswz query      [--connect host:port] [--top-k <n>] [--ef <n>]
         \\  hnswz benchmark  [--config <path>] [benchmark flags]
         \\  hnswz serve      --config <path> [serve flags]
@@ -567,6 +576,11 @@ pub fn printUsage() !void {
         \\                    (benchmark has its own defaults; if a config is
         \\                    provided, dim/ef_*/seed are inherited).
         \\  --source <dir>    (build only) Directory of .txt files to ingest.
+        \\  --workers <n>     (build only) Embedding worker-pool size. Each
+        \\                    worker runs an independent Ollama HTTP client
+        \\                    in parallel; main thread keeps HNSW insertion
+        \\                    strictly in filename-sorted order. Default 0
+        \\                    (auto = min(cpu, 8)). Also accepts --n-workers.
         \\  --top-k <n>       (query/benchmark/client) Results per search.
         \\                    Default 5 for query/client, 10 for benchmark.
         \\
@@ -655,6 +669,7 @@ fn describeParseError(err: ParseError) []const u8 {
         error.InvalidTopK => "--top-k must be a non-negative integer",
         error.InvalidBenchmarkNumber => "benchmark integer flag could not be parsed",
         error.InvalidBenchmarkTransport => "--transport must be 'in-process' or 'tcp'",
+        error.InvalidBuildNumber => "build integer flag could not be parsed",
         error.InvalidServeNumber => "serve integer flag could not be parsed",
         error.InvalidClientVerb => "unknown client verb (expected one of: ping, stats, snapshot, get, delete, insert-text, insert-vec, replace-text, replace-vec, search-text, search-vec)",
         error.InvalidClientNumber => "client integer flag could not be parsed",
@@ -689,6 +704,7 @@ pub fn parseOrExit(allocator: std.mem.Allocator) Args {
             error.InvalidTopK,
             error.InvalidBenchmarkNumber,
             error.InvalidBenchmarkTransport,
+            error.InvalidBuildNumber,
             error.InvalidServeNumber,
             error.InvalidClientVerb,
             error.InvalidClientNumber,
@@ -727,6 +743,32 @@ test "parse: build with space-separated flags" {
     try testing.expectEqual(Subcommand.build, std.meta.activeTag(args.command));
     try testing.expectEqualStrings("cfg.json", args.config_path.?);
     try testing.expectEqualStrings("./docs", args.command.build.source_dir.?);
+    try testing.expect(args.command.build.n_workers == null);
+}
+
+test "parse: build --workers" {
+    var it: SliceIter = .{ .slice = &.{
+        "build",     "--config", "cfg.json",
+        "--source",  "./docs",   "--workers",
+        "8",
+    } };
+    var args = try parseFromIter(testing.allocator, &it);
+    defer args.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 8), args.command.build.n_workers.?);
+}
+
+test "parse: build --n-workers alias" {
+    var it: SliceIter = .{ .slice = &.{ "build", "--config=cfg.json", "--source=./docs", "--n-workers=4" } };
+    var args = try parseFromIter(testing.allocator, &it);
+    defer args.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 4), args.command.build.n_workers.?);
+}
+
+test "parse: build --workers rejects non-numeric" {
+    var it: SliceIter = .{ .slice = &.{ "build", "--workers", "abc" } };
+    try testing.expectError(error.InvalidBuildNumber, parseFromIter(testing.allocator, &it));
 }
 
 test "parse: query with equals-form flags and custom top-k" {

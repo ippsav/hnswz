@@ -49,7 +49,7 @@ pub fn main() !void {
                         log.err("build requires --source <dir>", .{});
                         std.process.exit(cli.USAGE_EXIT_CODE);
                     };
-                    try runBuild(allocator, cfg, src);
+                    try runBuild(allocator, cfg, src, b.n_workers orelse 0);
                 },
                 .serve => |*s| try runServe(allocator, cfg, s),
                 .benchmark, .client, .query => unreachable,
@@ -86,7 +86,113 @@ fn strLessThan(_: void, a: []u8, b: []u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, source: []const u8) !void {
+/// Per-job coordination slot. Main fills `name` before pushing the slot
+/// index onto the job queue; the worker reads `name`, embeds into `vec`,
+/// writes `err`, and flips `ready`. The main thread consumes slots in
+/// strict submission order so `store.add()` assigns ids that match the
+/// filename-sorted position of each file — metadata stays consistent.
+const BuildSlot = struct {
+    /// Borrowed slice into `filenames[submitted]`. Worker reads only.
+    name: []const u8 = "",
+    /// Per-slot scratch of length `cfg.embedder.dim`. Embedder writes;
+    /// main reads after the worker marks the slot ready.
+    vec: []f32,
+    /// Worker stores the embed error (or null) here under `mutex` before
+    /// setting `ready`.
+    err: ?anyerror = null,
+    /// False while main owns the slot (submission) or the worker is
+    /// processing; true once the worker is done and main may consume.
+    ready: bool = false,
+};
+
+/// State shared between the main thread and the embed worker pool. Lives
+/// on the main thread's stack; workers hold a `*BuildShared` so its
+/// address must be stable for the duration of the build.
+const BuildShared = struct {
+    slots: []BuildSlot,
+    jobs: std.ArrayList(usize),
+    jobs_closed: bool = false,
+    mutex: std.Thread.Mutex = .{},
+    jobs_cond: std.Thread.Condition = .{},
+    done_cond: std.Thread.Condition = .{},
+};
+
+/// Read + embed one file into `vec`. Used inside the worker loop so the
+/// main `embedWorkerLoop` stays a thin pop/dispatch/signal shell.
+fn embedOneFile(
+    allocator: std.mem.Allocator,
+    embedder: hnswz.Embedder,
+    src_dir: std.fs.Dir,
+    name: []const u8,
+    vec: []f32,
+    max_text_bytes: usize,
+) !void {
+    var file = try src_dir.openFile(name, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, max_text_bytes);
+    defer allocator.free(content);
+    try embedder.embed(content, vec);
+}
+
+/// Worker entry point. Each worker owns a dedicated `OllamaClient` and
+/// loops pop → embed → mark-ready until the jobs queue is drained and
+/// `jobs_closed` is set. Embed errors are recorded on the slot and
+/// surfaced to the main thread on consume; they do not terminate the
+/// worker so the remaining in-flight slots can still be drained.
+fn embedWorkerLoop(
+    shared: *BuildShared,
+    allocator: std.mem.Allocator,
+    client: *hnswz.OllamaClient,
+    src_dir: std.fs.Dir,
+    max_text_bytes: usize,
+) void {
+    const embedder = client.embedder();
+    while (true) {
+        shared.mutex.lock();
+        while (shared.jobs.items.len == 0 and !shared.jobs_closed) {
+            shared.jobs_cond.wait(&shared.mutex);
+        }
+        // Under normal shutdown the queue drains to empty first; under
+        // error shutdown main has set `jobs_closed` and returned early,
+        // so skip any still-queued work instead of running up wasted
+        // HTTP calls that nobody is waiting for.
+        if (shared.jobs.items.len == 0 or shared.jobs_closed) {
+            shared.mutex.unlock();
+            return;
+        }
+        const slot_idx = shared.jobs.pop().?;
+        shared.mutex.unlock();
+
+        const slot = &shared.slots[slot_idx];
+        const res = embedOneFile(allocator, embedder, src_dir, slot.name, slot.vec, max_text_bytes);
+
+        shared.mutex.lock();
+        if (res) |_| {
+            slot.err = null;
+        } else |e| {
+            slot.err = e;
+        }
+        slot.ready = true;
+        shared.mutex.unlock();
+        shared.done_cond.broadcast();
+    }
+}
+
+/// Resolve the auto (`0`) worker count to a concrete value. Embedding is
+/// network-bound (HTTP to Ollama), so extra threads past ~8 rarely help
+/// and can swamp a local Ollama with concurrent requests.
+fn resolveBuildWorkers(requested: usize) usize {
+    if (requested != 0) return requested;
+    const cpu = std.Thread.getCpuCount() catch 4;
+    return @min(@as(usize, 8), @max(@as(usize, 1), cpu));
+}
+
+fn runBuild(
+    allocator: std.mem.Allocator,
+    cfg: *const hnswz.config.Config,
+    source: []const u8,
+    requested_workers: usize,
+) !void {
     var src_dir = std.fs.cwd().openDir(source, .{ .iterate = true }) catch |err| {
         log.err("cannot open --source '{s}': {s}", .{ source, @errorName(err) });
         std.process.exit(1);
@@ -151,17 +257,16 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, sourc
         log.err("{d} files exceeds config.storage.max_vectors={d}", .{ n, cfg.storage.max_vectors });
         std.process.exit(1);
     }
-    log.info("ingesting {d} files from {s}", .{ n, source });
-
-    // Embedder.
-    var client = try hnswz.OllamaClient.init(
-        allocator,
-        cfg.embedder.model,
-        cfg.embedder.base_url,
-        .{ .max_text_bytes = cfg.embedder.max_text_bytes, .dim = cfg.embedder.dim },
+    const n_workers = @min(resolveBuildWorkers(requested_workers), n);
+    // Inflight window sized so every worker has a fresh job queued and
+    // another already waiting — keeps the pool saturated while main is
+    // busy on store.add + index.insert. Capped at `n` for tiny corpora
+    // so we don't preallocate more slots than files.
+    const n_inflight = @min(2 * n_workers, n);
+    log.info(
+        "ingesting {d} files from {s} (workers={d}, inflight={d})",
+        .{ n, source, n_workers, n_inflight },
     );
-    defer client.deinit();
-    const embedder = client.embedder();
 
     // Store sized for max_vectors.
     var store = try hnswz.Store.init(allocator, cfg.embedder.dim, cfg.storage.max_vectors);
@@ -179,22 +284,113 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const hnswz.config.Config, sourc
     var ws = try Index.Workspace.init(allocator, cfg.storage.max_vectors, cfg.index.max_ef);
     defer ws.deinit(allocator);
 
-    const vec_buf = try allocator.alloc(f32, cfg.embedder.dim);
-    defer allocator.free(vec_buf);
+    // Per-slot vec buffers, carved out of one flat allocation so the
+    // hot path is contiguous f32 stripes.
+    const vecs_flat = try allocator.alloc(f32, n_inflight * cfg.embedder.dim);
+    defer allocator.free(vecs_flat);
 
-    for (filenames.items, 0..) |name, i| {
-        const file = try src_dir.openFile(name, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, cfg.embedder.max_text_bytes);
-        defer allocator.free(content);
+    const pipeline_slots = try allocator.alloc(BuildSlot, n_inflight);
+    defer allocator.free(pipeline_slots);
+    for (pipeline_slots, 0..) |*s, i| {
+        s.* = .{ .vec = vecs_flat[i * cfg.embedder.dim ..][0..cfg.embedder.dim] };
+    }
 
-        try embedder.embed(content, vec_buf);
-        if (cfg.embedder.normalize) hnswz.bruteforce.normalize(vec_buf);
+    var shared: BuildShared = .{
+        .slots = pipeline_slots,
+        .jobs = .{},
+    };
+    try shared.jobs.ensureTotalCapacity(allocator, n_inflight);
+    defer shared.jobs.deinit(allocator);
 
-        const id = try store.add(vec_buf);
+    // One Ollama client per worker. The client is single-threaded by
+    // design (all scratch buffers are shared); spinning up N of them is
+    // cheap (~64 KiB request buffer + ~100 KiB response per client at
+    // dim=4096).
+    const clients = try allocator.alloc(hnswz.OllamaClient, n_workers);
+    defer allocator.free(clients);
+    var clients_inited: usize = 0;
+    defer {
+        var i = clients_inited;
+        while (i > 0) {
+            i -= 1;
+            clients[i].deinit();
+        }
+    }
+    for (clients) |*c| {
+        c.* = try hnswz.OllamaClient.init(
+            allocator,
+            cfg.embedder.model,
+            cfg.embedder.base_url,
+            .{ .max_text_bytes = cfg.embedder.max_text_bytes, .dim = cfg.embedder.dim },
+        );
+        clients_inited += 1;
+    }
+
+    const threads = try allocator.alloc(std.Thread, n_workers);
+    defer allocator.free(threads);
+    var threads_spawned: usize = 0;
+    defer {
+        // Signal shutdown (idempotent) and join every worker we managed
+        // to spawn. `jobs_closed` causes workers to drain whatever is
+        // still queued before returning.
+        shared.mutex.lock();
+        shared.jobs_closed = true;
+        shared.mutex.unlock();
+        shared.jobs_cond.broadcast();
+        for (threads[0..threads_spawned]) |t| t.join();
+    }
+
+    for (threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(
+            .{},
+            embedWorkerLoop,
+            .{ &shared, allocator, &clients[i], src_dir, cfg.embedder.max_text_bytes },
+        );
+        threads_spawned += 1;
+    }
+
+    // Bounded submit/consume window. Main dispatches in filename order
+    // (so ids == sorted position) and consumes in the same order; any
+    // reordering of completions across workers is hidden inside the
+    // ring buffer of slots.
+    var submitted: usize = 0;
+    var consumed: usize = 0;
+    while (consumed < n) {
+        while (submitted < n and submitted - consumed < n_inflight) {
+            const slot_idx = submitted % n_inflight;
+            const slot = &pipeline_slots[slot_idx];
+            slot.name = filenames.items[submitted];
+            slot.err = null;
+            slot.ready = false;
+
+            shared.mutex.lock();
+            shared.jobs.appendAssumeCapacity(slot_idx);
+            shared.mutex.unlock();
+            shared.jobs_cond.signal();
+
+            submitted += 1;
+        }
+
+        const consume_slot_idx = consumed % n_inflight;
+        const consume_slot = &pipeline_slots[consume_slot_idx];
+        shared.mutex.lock();
+        while (!consume_slot.ready) {
+            shared.done_cond.wait(&shared.mutex);
+        }
+        const maybe_err = consume_slot.err;
+        shared.mutex.unlock();
+
+        if (maybe_err) |e| {
+            log.err("embed failed on '{s}': {s}", .{ consume_slot.name, @errorName(e) });
+            return e;
+        }
+
+        if (cfg.embedder.normalize) hnswz.bruteforce.normalize(consume_slot.vec);
+        const id = try store.add(consume_slot.vec);
         try index.insert(&ws, id);
 
-        std.debug.print("\rEmbedding+insert [{d}/{d}]", .{ i + 1, n });
+        std.debug.print("\rEmbedding+insert [{d}/{d}]", .{ consumed + 1, n });
+        consumed += 1;
     }
     std.debug.print("\n", .{});
 
