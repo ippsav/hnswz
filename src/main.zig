@@ -112,6 +112,11 @@ const BuildShared = struct {
     slots: []BuildSlot,
     jobs: std.ArrayList(usize),
     jobs_closed: bool = false,
+    /// Monotonic count of embeds finished (success or error). Guarded by
+    /// `mutex`. Main reads it to render a progress line that advances as
+    /// workers complete, not just as main consumes — so a slow head-of-line
+    /// slot doesn't make the display look stuck.
+    embeds_completed: usize = 0,
     mutex: std.Thread.Mutex = .{},
     jobs_cond: std.Thread.Condition = .{},
     done_cond: std.Thread.Condition = .{},
@@ -173,9 +178,19 @@ fn embedWorkerLoop(
             slot.err = e;
         }
         slot.ready = true;
+        shared.embeds_completed += 1;
         shared.mutex.unlock();
         shared.done_cond.broadcast();
     }
+}
+
+/// Render the one-line build progress display. Two counters since the
+/// pipeline is split: embeds advance in parallel (workers), inserts
+/// advance strictly in submission order on the main thread, so
+/// `embeds >= inserts` always and the gap shows how much parallelism
+/// is hiding head-of-line latency.
+fn printBuildProgress(embeds: usize, inserts: usize, total: usize) void {
+    std.debug.print("\rEmbed [{d}/{d}]  Insert [{d}/{d}]   ", .{ embeds, total, inserts, total });
 }
 
 /// Resolve the auto (`0`) worker count to a concrete value. Embedding is
@@ -373,11 +388,21 @@ fn runBuild(
 
         const consume_slot_idx = consumed % n_inflight;
         const consume_slot = &pipeline_slots[consume_slot_idx];
+
+        // Wait for the head-of-line slot, redrawing progress on every
+        // worker completion so a slow slot-0 doesn't freeze the display
+        // while slots 1..N finish behind it.
         shared.mutex.lock();
         while (!consume_slot.ready) {
+            const embeds = shared.embeds_completed;
+            shared.mutex.unlock();
+            printBuildProgress(embeds, consumed, n);
+            shared.mutex.lock();
+            if (consume_slot.ready) break;
             shared.done_cond.wait(&shared.mutex);
         }
         const maybe_err = consume_slot.err;
+        const embeds_now = shared.embeds_completed;
         shared.mutex.unlock();
 
         if (maybe_err) |e| {
@@ -389,8 +414,8 @@ fn runBuild(
         const id = try store.add(consume_slot.vec);
         try index.insert(&ws, id);
 
-        std.debug.print("\rEmbedding+insert [{d}/{d}]", .{ consumed + 1, n });
         consumed += 1;
+        printBuildProgress(embeds_now, consumed, n);
     }
     std.debug.print("\n", .{});
 
